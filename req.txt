@@ -1,0 +1,8 @@
+cdasws==1.7.40
+cdflib==0.4.4
+jupyter
+numpy==1.23.1
+pandas==1.4.3
+torch
+xarray==2022.6.0
+git+https://github.com/aliutkus/torchinterp1d
