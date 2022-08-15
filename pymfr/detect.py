@@ -45,6 +45,14 @@ def detect_flux_ropes(magnetic_field,
     :param window_steps: A range of sliding window strides.
     :param min_strength: Minimum <B> for sliding window candidates in nT.
     :param frame_type: The method used to estimate the propagation direction of the flux rope.
+    Options:
+    - "mean_velocity"
+        Simply takes the average velocity over the window. Fastest but least precise.
+    - "vht":
+        Finds the frame that minimizes the averaged electric field magnitude squared.
+    - "vht_2d":
+        Finds a frame with an approximately constant electric field magnitude
+        along the trial axis, which in theory should be present for a 2D structure.
     :param altitude_range: Range of trial axis altitudes.
     :param azimuth_range: Range of trial axis azimuths.
     :param threshold_diff: The maximum allowable R_diff
@@ -58,15 +66,8 @@ def detect_flux_ropes(magnetic_field,
     we crossed the flux boundary twice, high enough to account for uncertainties in the measurements
     and calculations. By default, it is 0.05.
     :param cuda: Whether to use the GPU
-    Options:
-    - "mean_velocity"
-        Simply takes the average velocity over the window. Fastest but least precise.
-    - "vht":
-        Finds the frame that minimizes the averaged electric field magnitude squared.
-    - "vht_2d":
-        Finds a frame with an approximately constant electric field magnitude
-        along the trial axis, which in theory should be present for a 2D structure.
-    :return:
+    :return: A list of tuples.
+    In the future this should be replaced with a list of specialized objectsr a dataframe.
     """
 
     tensor = _pack_data(magnetic_field, velocity, density)
