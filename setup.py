@@ -15,5 +15,5 @@ setup(
     install_requires=["torch>=1.8.2",
                       "numpy",
                       "tqdm",
-                      "git+https://github.com/aliutkus/torchinterp1d"]
+                      "torchinterp1d @ git+https://github.com/aliutkus/torchinterp1d.git"]
 )
