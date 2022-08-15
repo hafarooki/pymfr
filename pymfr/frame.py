@@ -8,6 +8,8 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
     the electric field in such a frame is zero.
 
     References:
+    Paschmann, Gotz, and Bengt U. O. Sonnerup.
+    “Proper Frame Determination and Walen Test.” ISSI Scientific Reports Series 8 (January 1, 2008): 65–74.
 
     :param magnetic_field: Tensor with shape ([B, ]N, 3).
     :param electric_field: Tensor with shape ([B, ]N, 3).
@@ -43,8 +45,15 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
                         axes: torch.tensor):
     """
     Find the frame where the electric field along the axis is zero.
+    Assumes that the covariance matrix of the magnetic field
+    is invertible and that there is no perfect DeHoffman-Teller frame.
+    If this becomes an issue, a possible solution would be to
+    use least square solution instead of exactly solving
+    the linear system, but that needs to be investigated first.
 
     References:
+    Paschmann, Gotz, and Bengt U. O. Sonnerup.
+    “Proper Frame Determination and Walen Test.” ISSI Scientific Reports Series 8 (January 1, 2008): 65–74.
 
     :param magnetic_field: Tensor with shape ([B, ]N, 3)
     :param electric_field: Tensor with shape ([B, ]N, 3)
