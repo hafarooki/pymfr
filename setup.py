@@ -12,5 +12,8 @@ setup(
     author_email="haf5@njit.edu",
     packages=["pymfr"],
     keywords="pymfr fluxrope mfr smfr grad-shafranov gs",
-    install_requires=["torch>=1.8.2"]
+    install_requires=["torch>=1.8.2",
+                      "numpy",
+                      "tqdm",
+                      "git+https://github.com/aliutkus/torchinterp1d"]
 )
