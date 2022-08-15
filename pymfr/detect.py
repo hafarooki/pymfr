@@ -67,7 +67,7 @@ def detect_flux_ropes(magnetic_field,
     and calculations. By default, it is 0.05.
     :param cuda: Whether to use the GPU
     :return: A list of tuples.
-    In the future this should be replaced with a list of specialized object or a dataframe.
+    In the future this should be replaced with a list of specialized objects or a dataframe.
     """
 
     tensor = _pack_data(magnetic_field, velocity, density)
