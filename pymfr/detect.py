@@ -134,7 +134,7 @@ def detect_flux_ropes(magnetic_field,
             mask = (alfvenicity <= threshold_walen) & \
                    (inflection_point_counts == 1) & \
                    (potential[:, -1].abs() / potential.abs().amax(dim=1) < threshold_folding) & \
-                   (peaks >= thresholds) & \
+                   (peaks > thresholds) & \
                    ((max_pressure - min_pressure) > 0)
 
             for i in torch.nonzero(mask).flatten():
