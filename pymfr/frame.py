@@ -82,7 +82,7 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
         # add extra dimension after batch dimensions for axes
         solutions = solutions.unsqueeze(-3).expand(*((-1,) * (len(axes.shape) - 2)), axes.shape[-2], -1, -1)
 
-    frames = torch.cross(axes, (solutions @ axes.unsqueeze(-1)).squeeze(-1))
+    frames = torch.cross(axes, (solutions @ axes.unsqueeze(-1)).squeeze(-1), dim=-1)
     return frames
 
 
