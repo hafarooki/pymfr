@@ -20,6 +20,7 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
     """
 
     assert magnetic_field.shape == electric_field.shape
+    assert magnetic_field.dtype == electric_field.dtype
     assert len(magnetic_field.shape) >= 2
     assert magnetic_field.shape[-1] == 3
     assert magnetic_field.device == electric_field.device
@@ -29,7 +30,8 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
     coefficients = [[By ** 2 + Bz ** 2, -Bx * By, -Bx * Bz],
                     [-Bx * By, Bx ** 2 + Bz ** 2, -By * Bz],
                     [-Bx * Bz, -By * Bz, Bx ** 2 + By ** 2]]
-    coefficient_matrix = torch.zeros((*magnetic_field.shape[:-2], 3, 3), device=magnetic_field.device)
+    coefficient_matrix = torch.zeros((*magnetic_field.shape[:-2], 3, 3), device=magnetic_field.device,
+                                     dtype=magnetic_field.dtype)
     for i in range(3):
         for j in range(3):
             coefficient_matrix[..., i, j] = coefficients[i][j].mean(dim=-1)
@@ -65,6 +67,7 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
     """
 
     assert magnetic_field.shape == electric_field.shape
+    assert magnetic_field.dtype == electric_field.dtype
     assert len(magnetic_field.shape) >= 2
     assert magnetic_field.shape[-1] == axes.shape[-1] == 3
     assert magnetic_field.device == electric_field.device == axes.device
@@ -88,11 +91,12 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
 
 def _covariance(a, b):
     assert a.shape == b.shape
+    assert a.dtype == b.dtype
     assert len(a.shape) >= 2
 
     d_a = a - a.mean(dim=-2, keepdim=True)
     d_b = b - b.mean(dim=-2, keepdim=True)
-    matrix = torch.zeros((*a.shape[:-2], a.shape[-1], a.shape[-1]), device=a.device)
+    matrix = torch.zeros((*a.shape[:-2], a.shape[-1], a.shape[-1]), device=a.device, dtype=a.dtype)
     for i in range(3):
         for j in range(3):
             matrix[..., i, j] = (d_a[..., i] * d_b[..., j]).mean(dim=-1)
