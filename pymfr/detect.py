@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 import tqdm as tqdm
 
+from pymfr.axis import _get_trial_axes, _rotate_field
+from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _calculate_trim_mask
 from pymfr.frame import _find_frames
 
 from pymfr.walen_test import _calculate_alfvenicity
@@ -24,7 +26,7 @@ def detect_flux_ropes(magnetic_field,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
-                      threshold_folding=0.05,
+                      threshold_folding=0.5,
                       cuda=True):
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
@@ -73,7 +75,9 @@ def detect_flux_ropes(magnetic_field,
 
     tensor = _pack_data(magnetic_field, velocity, density)
 
-    trial_axes = _get_trial_axes(altitude_range, azimuth_range, cuda)
+    trial_axes = _get_trial_axes(altitude_range, azimuth_range)
+    if cuda:
+        trial_axes = trial_axes.cuda()
 
     # these are updated as the algorithm runs
     # contains_existing keeps track of samples that were already confirmed as MFRs
@@ -120,33 +124,31 @@ def detect_flux_ropes(magnetic_field,
 
             alfvenicity = _calculate_alfvenicity(batch_frames, batch_data)
 
-            rotated_field = _rotate_field(batch_axes, batch_data, batch_frames)
+            rotated_field = _rotate_field(batch_axes, batch_data[:, :, :3], batch_frames)
 
             potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
             potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
 
+            transverse_pressure = rotated_field[:, :, 2] ** 2
+
+            alfvenicity_mask = alfvenicity <= threshold_walen
+
             inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
-            folding_mask = (potential[:, -1].abs() / potential.abs().amax(dim=1)) < threshold_folding
+            trim_mask = _calculate_trim_mask(potential, threshold_folding)
 
             # if a window can have multiple inflection points at any angle despite trimming it is probably
             # multiple mfrs in one
-            single_mfr_mask = ~folding_mask | (inflection_point_counts <= 1)
+            single_mfr_mask = ~trim_mask | (inflection_point_counts <= 1)
             single_mfr_mask = single_mfr_mask.reshape(len(trial_axes), -1)
             single_mfr_mask = torch.all(single_mfr_mask, dim=0)
             single_mfr_mask = single_mfr_mask.repeat(len(trial_axes))
 
-            transverse_pressure = rotated_field[:, :, 2] ** 2
-            peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
-                                        inflection_points]
-            min_pressure, max_pressure = torch.aminmax(transverse_pressure, dim=1)
-            thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
-            mask = (alfvenicity <= threshold_walen) & \
-                   single_mfr_mask & \
-                   (inflection_point_counts == 1) & \
-                   (folding_mask) & \
-                   (peaks > thresholds) & \
-                   ((max_pressure - min_pressure) > 0)
+            folding_mask = _calculate_folding_mask(inflection_points,
+                                                   inflection_point_counts,
+                                                   transverse_pressure)
+
+            mask = alfvenicity_mask & single_mfr_mask & trim_mask & folding_mask
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
@@ -206,19 +208,6 @@ def _pack_data(magnetic_field, velocity, density):
     return torch.concat([magnetic_field, velocity, alfven_velocity], dim=1)
 
 
-def _get_trial_axes(altitude_range, azimuth_range, cuda):
-    trial_axes = [torch.tensor([np.sin(np.deg2rad(altitude)) * np.cos(np.deg2rad(azimuth)),
-                                np.sin(np.deg2rad(altitude)) * np.sin(np.deg2rad(azimuth)),
-                                np.cos(np.deg2rad(altitude))], dtype=torch.float32)
-                  for altitude in altitude_range
-                  for azimuth in azimuth_range]
-    trial_axes.append(torch.tensor([0, 0, 1], dtype=torch.float32))
-    trial_axes = torch.row_stack(trial_axes)
-    if cuda:
-        trial_axes = trial_axes.cuda()
-    return trial_axes
-
-
 def _get_sliding_windows(window_lengths, window_steps):
     assert list(sorted(window_lengths)) == list(sorted(set(window_lengths))), "window lengths must be unique"
     assert len(window_lengths) == len(window_steps), "must have same number of window steps and lengths"
@@ -233,16 +222,6 @@ def _resize(batch_data, batch_starts, trial_axes):
     batch_data = batch_data.repeat(len(trial_axes), 1, 1)
     batch_starts = batch_starts.repeat(len(trial_axes))
     return batch_data, batch_starts
-
-
-def _rotate_field(batch_axes, batch_data, batch_frames):
-    z_unit = batch_axes
-    x_unit = F.normalize(-(batch_frames - (batch_frames * z_unit).sum(dim=1).unsqueeze(1) * z_unit))
-    y_unit = torch.cross(z_unit, x_unit)
-    rotation_matrix = torch.stack([x_unit, y_unit, z_unit], dim=2)
-    rotation_matrix = rotation_matrix.transpose(1, 2)  # transpose gives inverse of rotation matrix
-    rotated_field = (rotation_matrix @ batch_data[:, :, :3].transpose(1, 2)).transpose(1, 2)
-    return rotated_field
 
 
 def _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit):
@@ -273,24 +252,3 @@ def _cleanup_candidates(contains_existing, event_candidates, remaining_events, t
                 continue
 
             del event_candidates[other_key]
-
-
-def _find_inflection_points(potential):
-    duration = potential.shape[1]
-    kernel_size = duration // 16 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
-
-    if kernel_size > 1:
-        smoothed = F.avg_pool1d(potential,
-                                 kernel_size=kernel_size,
-                                 stride=1,
-                                 padding=(kernel_size - 1) // 2,
-                                 count_include_pad=False)
-        assert smoothed.shape[1] == duration
-    else:
-        smoothed = potential
-
-    points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
-
-    inflection_points = points.argmax(dim=1) + 1
-    inflection_point_counts = points.sum(dim=1)
-    return inflection_point_counts, inflection_points
