@@ -23,12 +23,16 @@ def _find_inflection_points(potential):
     return inflection_point_counts, inflection_points
 
 
-def _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure):
+def _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
+                            potential, threshold_folding):
     peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                 inflection_points]
     min_pressure, max_pressure = torch.aminmax(transverse_pressure, dim=1)
     thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
-    mask = (inflection_point_counts == 1) & (peaks > thresholds) & ((max_pressure - min_pressure) > 0)
+    mask = ((potential[:, -1].abs() / potential.abs().amax(dim=1)) < threshold_folding) & \
+           (inflection_point_counts == 1) & \
+           (peaks > thresholds) & \
+           (max_pressure - min_pressure > 0)
     return mask
 
 

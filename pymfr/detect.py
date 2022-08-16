@@ -135,20 +135,13 @@ def detect_flux_ropes(magnetic_field,
 
             inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
-            trim_mask = _calculate_trim_mask(potential, threshold_folding)
-
-            # if a window can have multiple inflection points at any angle despite trimming it is probably
-            # multiple mfrs in one
-            single_mfr_mask = ~trim_mask | (inflection_point_counts <= 1)
-            single_mfr_mask = single_mfr_mask.reshape(len(trial_axes), -1)
-            single_mfr_mask = torch.all(single_mfr_mask, dim=0)
-            single_mfr_mask = single_mfr_mask.repeat(len(trial_axes))
-
             folding_mask = _calculate_folding_mask(inflection_points,
                                                    inflection_point_counts,
-                                                   transverse_pressure)
+                                                   transverse_pressure,
+                                                   potential,
+                                                   threshold_folding)
 
-            mask = alfvenicity_mask & single_mfr_mask & trim_mask & folding_mask
+            mask = alfvenicity_mask & folding_mask
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]

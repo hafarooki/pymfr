@@ -30,7 +30,8 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=5):
 
         inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
-        folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure)
+        folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
+                                               potential, 0.5)
 
         for j in torch.nonzero(folding_mask).flatten():
             inflection_point = inflection_points[j]
