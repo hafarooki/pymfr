@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -126,9 +127,11 @@ def detect_flux_ropes(magnetic_field,
 
             inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
-            # if a window can have multiple inflection points at any angle it is probably
+            folding_mask = (potential[:, -1].abs() / potential.abs().amax(dim=1)) < threshold_folding
+
+            # if a window can have multiple inflection points at any angle despite trimming it is probably
             # multiple mfrs in one
-            single_mfr_mask = inflection_point_counts <= 1
+            single_mfr_mask = ~folding_mask | (inflection_point_counts <= 1)
             single_mfr_mask = single_mfr_mask.reshape(len(trial_axes), -1)
             single_mfr_mask = torch.all(single_mfr_mask, dim=0)
             single_mfr_mask = single_mfr_mask.repeat(len(trial_axes))
@@ -141,7 +144,7 @@ def detect_flux_ropes(magnetic_field,
             mask = (alfvenicity <= threshold_walen) & \
                    single_mfr_mask & \
                    (inflection_point_counts == 1) & \
-                   (potential[:, -1].abs() / potential.abs().amax(dim=1) < threshold_folding) & \
+                   (folding_mask) & \
                    (peaks > thresholds) & \
                    ((max_pressure - min_pressure) > 0)
 
@@ -274,19 +277,27 @@ def _cleanup_candidates(contains_existing, event_candidates, remaining_events, t
 
 def _find_inflection_points(potential):
     duration = potential.shape[1]
-    kernel_size = duration // 4 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
+    kernel_size = duration // 8 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
 
     if kernel_size > 1:
-        potential = F.avg_pool1d(potential,
+        smoothed = F.avg_pool1d(potential,
                                  kernel_size=kernel_size,
                                  stride=1,
                                  padding=(kernel_size - 1) // 2,
                                  count_include_pad=False)
-        assert potential.shape[1] == duration
+        # import torchvision.transforms.functional as FV
+        # smoothed = FV.gaussian_blur(potential.unsqueeze(1), kernel_size=(kernel_size, 1)).squeeze(1)
+        assert smoothed.shape[1] == duration
+    else:
+        smoothed = potential
 
-    points = (torch.diff(torch.sign(torch.diff(potential))) != 0).int()
+    points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
 
     inflection_points = points.argmax(dim=1) + 1
     inflection_point_counts = points.sum(dim=1)
+
+    # plt.plot(potential[0].cpu().numpy())
+    # plt.plot(smoothed[0].cpu().numpy(), "--")
+    # plt.show()
 
     return inflection_point_counts, inflection_points
