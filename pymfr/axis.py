@@ -6,7 +6,7 @@ from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _cal
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, frame_velocity, iterations=5):
+def minimize_rdiff(magnetic_field, frame_velocity, iterations=10):
     """
     WIP API for finding best axis using Rdiff as a criteria
     :param magnetic_field:
@@ -46,8 +46,8 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=5):
         x, y, z = tuple(best_axis.cpu().numpy())
         altitude = np.rad2deg(np.arctan2(np.sqrt(x ** 2 + y ** 2), z))
         azimuth = np.rad2deg(np.arctan2(y, x))
-        batch_axes = _get_trial_axes(np.linspace(altitude - 10 / (i + 1), altitude + 10 / (i + 1), 25),
-                                     np.linspace(azimuth - 20 / (i + 1), azimuth + 20 / (i + 1), 50))
+        batch_axes = _get_trial_axes(np.linspace(altitude - 5 / (i + 1), altitude + 5 / (i + 1), 10),
+                                     np.linspace(azimuth - 10 / (i + 1), azimuth + 10 / (i + 1), 20))
         batch_axes = batch_axes.to(magnetic_field.device)
 
     return best_axis, best_rdiff
