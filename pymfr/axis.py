@@ -6,7 +6,8 @@ from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _cal
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, frame_velocity, iterations=10):
+def minimize_rdiff(magnetic_field, frame_velocity, iterations=10,
+                   threshold_folding=0.5):
     """
     WIP API for finding best axis using Rdiff as a criteria
     :param magnetic_field:
@@ -31,7 +32,7 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=10):
         inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
         folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
-                                               potential, 0.5)
+                                               potential, threshold_folding)
 
         for j in torch.nonzero(folding_mask).flatten():
             inflection_point = inflection_points[j]
