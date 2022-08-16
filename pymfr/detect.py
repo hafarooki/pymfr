@@ -126,12 +126,20 @@ def detect_flux_ropes(magnetic_field,
 
             inflection_point_counts, inflection_points = _find_inflection_points(potential)
 
+            # if a window can have multiple inflection points at any angle it is probably
+            # multiple mfrs in one
+            single_mfr_mask = inflection_point_counts <= 1
+            single_mfr_mask = single_mfr_mask.reshape(len(trial_axes), -1)
+            single_mfr_mask = torch.all(single_mfr_mask, dim=0)
+            single_mfr_mask = single_mfr_mask.repeat(len(trial_axes))
+
             transverse_pressure = rotated_field[:, :, 2] ** 2
             peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                         inflection_points]
             min_pressure, max_pressure = torch.aminmax(transverse_pressure, dim=1)
             thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
             mask = (alfvenicity <= threshold_walen) & \
+                   single_mfr_mask & \
                    (inflection_point_counts == 1) & \
                    (potential[:, -1].abs() / potential.abs().amax(dim=1) < threshold_folding) & \
                    (peaks > thresholds) & \
@@ -266,7 +274,7 @@ def _cleanup_candidates(contains_existing, event_candidates, remaining_events, t
 
 def _find_inflection_points(potential):
     duration = potential.shape[1]
-    kernel_size = duration // 8 // 2 * 2 + 1  # divide by 8, floor, round up to nearest odd
+    kernel_size = duration // 4 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
 
     if kernel_size > 1:
         potential = F.avg_pool1d(potential,
