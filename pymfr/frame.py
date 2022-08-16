@@ -67,7 +67,7 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
     """
 
     assert magnetic_field.shape == electric_field.shape
-    assert magnetic_field.dtype == electric_field.dtype
+    assert magnetic_field.dtype == electric_field.dtype == axes.dtype
     assert len(magnetic_field.shape) >= 2
     assert magnetic_field.shape[-1] == axes.shape[-1] == 3
     assert magnetic_field.device == electric_field.device == axes.device
