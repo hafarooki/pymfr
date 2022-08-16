@@ -277,7 +277,7 @@ def _cleanup_candidates(contains_existing, event_candidates, remaining_events, t
 
 def _find_inflection_points(potential):
     duration = potential.shape[1]
-    kernel_size = duration // 8 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
+    kernel_size = duration // 16 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
 
     if kernel_size > 1:
         smoothed = F.avg_pool1d(potential,
