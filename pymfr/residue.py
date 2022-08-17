@@ -6,31 +6,40 @@ interp = Interp1d()
 
 
 def _calculate_residue_diff(inflection_points, potential, pressure):
+    assert len(inflection_points.shape) == 1
+    assert len(potential.shape) == 2
+    assert len(pressure.shape) == 2
+
     interp = Interp1d()
 
     min_pressure, max_pressure = torch.aminmax(pressure, dim=1)
     pressure_range = max_pressure - min_pressure
 
-    combined_data = torch.concat((potential.unsqueeze(1), pressure.unsqueeze(1)), dim=1)
-
     # second dim is potential1, pressure1, potential2, pressure2
-    folded_data = combined_data[:, :, :].repeat(1, 2, 1)
+    folded_data = torch.concat((potential.unsqueeze(1), pressure.unsqueeze(1)), dim=1).repeat(1, 2, 1)
 
-    points = inflection_points
+    all_indices = torch.arange(folded_data.shape[2], device=inflection_points.device)
+    all_indices = all_indices.unsqueeze(0).unsqueeze(1).expand(folded_data.shape[0], 2, -1)
+    before = all_indices < inflection_points.unsqueeze(1).unsqueeze(2)
+    after = all_indices > inflection_points.unsqueeze(1).unsqueeze(2)
 
-    all_indices = torch.arange(combined_data.shape[2], device=points.device)
-    all_indices = all_indices.unsqueeze(0).unsqueeze(1).expand(combined_data.shape[0], 2, -1)
-    before = all_indices < points.unsqueeze(1).unsqueeze(2)
-    after = all_indices > points.unsqueeze(1).unsqueeze(2)
-
-    inflection_point_values = combined_data[torch.arange(len(combined_data), device=combined_data.device), :, points]
-    inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, combined_data.shape[2])
+    indices = torch.arange(len(folded_data), device=folded_data.device)
+    inflection_point_values = folded_data[indices, :2, inflection_points]
+    inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, folded_data.shape[2])
 
     # in first half, values after inflection point should be the inflection points repeated
     folded_data[:, :2, :][before] = inflection_point_values[before]
 
     # in second half, values before inflection point should be the inflection points repeated
     folded_data[:, 2:, :][after] = inflection_point_values[after]
+
+    sort1 = torch.argsort(folded_data[:, 0, :], dim=1)
+    folded_data[:, 0, :] = folded_data[:, 0, :].gather(1, sort1)
+    folded_data[:, 1, :] = folded_data[:, 1, :].gather(1, sort1)
+
+    sort2 = torch.argsort(folded_data[:, 2, :], dim=1)
+    folded_data[:, 2, :] = folded_data[:, 2, :].gather(1, sort2)
+    folded_data[:, 3, :] = folded_data[:, 3, :].gather(1, sort2)
 
     interp_potential = torch.sort(potential, dim=1)[0]
     interpolated1 = interp.forward(x=folded_data[:, 0, :],
@@ -42,7 +51,8 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
 
     interp_diff = interpolated1 - interpolated2
 
-    return torch.sqrt(torch.mean(interp_diff ** 2, dim=1) / 2) / pressure_range
+    error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1) / 2) / pressure_range
+    return error_diff
 
 
 def _calculate_residue_fit(potential_array,
