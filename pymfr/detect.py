@@ -26,7 +26,7 @@ def detect_flux_ropes(magnetic_field,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
-                      threshold_folding=0.5,
+                      threshold_folding=0.05,
                       cuda=True):
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
@@ -143,25 +143,37 @@ def detect_flux_ropes(magnetic_field,
 
             mask = alfvenicity_mask & folding_mask
 
+            if torch.count_nonzero(mask) == 0:
+                continue
+
+            inflection_points = inflection_points[mask]
+            potential = potential[mask]
+            transverse_pressure = transverse_pressure[mask]
+            batch_axes = batch_axes[mask]
+            batch_frames = batch_frames[mask]
+            batch_starts = batch_starts[mask]
+
+            error_diff = _calculate_residue_diff(inflection_points,
+                                                 potential,
+                                                 transverse_pressure)
+
+            mask = (error_diff <= threshold_diff)
+
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
-                error_diff = _calculate_residue_diff(inflection_point, potential[i], transverse_pressure[i])
-
-                if error_diff > threshold_diff:
-                    continue
-
                 start = batch_starts[i]
                 event_index = start + inflection_point.item()
+                error_diff_i = error_diff[i].item()
 
                 if event_index in event_candidates:
-                    if error_diff >= event_candidates[event_index][0]:
+                    if error_diff_i >= event_candidates[event_index][0]:
                         continue
 
                 error_fit = _calculate_residue_fit(potential[i], transverse_pressure[i])
 
                 start = start
                 end = start + duration - 1
-                event_candidates[event_index] = (error_diff.item(),
+                event_candidates[event_index] = (error_diff_i,
                                                  start.item(),
                                                  end.item(),
                                                  duration,

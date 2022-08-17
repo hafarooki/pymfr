@@ -6,7 +6,7 @@ from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _cal
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, frame_velocity, iterations=10,
+def minimize_rdiff(magnetic_field, frame_velocity, iterations=3,
                    threshold_folding=0.5):
     """
     WIP API for finding best axis using Rdiff as a criteria
@@ -34,12 +34,12 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=10,
         folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
                                                potential, threshold_folding)
 
+        rdiff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
+
         for j in torch.nonzero(folding_mask).flatten():
-            inflection_point = inflection_points[j]
-            rdiff = _calculate_residue_diff(inflection_point, potential[j], transverse_pressure[j])
-            if best_rdiff is None or rdiff < best_rdiff:
+            if best_rdiff is None or rdiff[j] < best_rdiff:
                 best_axis = batch_axes[j]
-                best_rdiff = rdiff
+                best_rdiff = rdiff[j]
 
         if best_axis is None:
             break
@@ -47,8 +47,8 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=10,
         x, y, z = tuple(best_axis.cpu().numpy())
         altitude = np.rad2deg(np.arctan2(np.sqrt(x ** 2 + y ** 2), z))
         azimuth = np.rad2deg(np.arctan2(y, x))
-        batch_axes = _get_trial_axes(np.linspace(altitude - 5 / (i + 1), altitude + 5 / (i + 1), 10),
-                                     np.linspace(azimuth - 10 / (i + 1), azimuth + 10 / (i + 1), 20))
+        batch_axes = _get_trial_axes(np.linspace(altitude - 30 / (i + 1), altitude + 30 / (i + 1), 50),
+                                     np.linspace(azimuth - 60 / (i + 1), azimuth + 60 / (i + 1), 50))
         batch_axes = batch_axes.to(magnetic_field.device)
 
     return best_axis, best_rdiff
