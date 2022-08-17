@@ -10,6 +10,9 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     assert len(potential.shape) == 2
     assert len(pressure.shape) == 2
 
+    if len(inflection_points) == 0:
+        return torch.empty((0,), device=inflection_points.device, dtype=torch.float32)
+
     interp = Interp1d()
 
     min_pressure, max_pressure = torch.aminmax(pressure, dim=1)
