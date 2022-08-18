@@ -1,13 +1,11 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 
-from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _calculate_trim_mask
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3,
-                   threshold_folding=0.5):
+def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3):
     """
     WIP API for finding best axis using Rdiff as a criteria
     :param magnetic_field:
@@ -26,7 +24,7 @@ def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3,
         batch_gas_pressure = gas_pressure.unsqueeze(0).expand(len(batch_axes), -1)
 
         rotated_field = _rotate_field(batch_axes, batch_field, batch_frames)
-        transverse_pressure = gas_pressure + rotated_field[:, :, 2] * 2
+        transverse_pressure = batch_gas_pressure + rotated_field[:, :, 2] * 2
         potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
         potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
 
