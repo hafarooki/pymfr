@@ -31,10 +31,10 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, folded_data.shape[2])
 
     # in first half, values after inflection point should be the inflection points repeated
-    folded_data[:, :2, :][before] = inflection_point_values[before]
+    folded_data[:, :2, :] = torch.where(before, inflection_point_values, folded_data[:, :2, :])
 
     # in second half, values before inflection point should be the inflection points repeated
-    folded_data[:, 2:, :][after] = inflection_point_values[after]
+    folded_data[:, 2:, :] = torch.where(after, inflection_point_values, folded_data[:, :2, :])
 
     sort1 = torch.argsort(folded_data[:, 0, :], dim=1)
     folded_data[:, 0, :] = folded_data[:, 0, :].gather(1, sort1)
