@@ -26,18 +26,13 @@ def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3,
         batch_gas_pressure = gas_pressure.unsqueeze(0).expand(len(batch_axes), -1)
 
         rotated_field = _rotate_field(batch_axes, batch_field, batch_frames)
-        transverse_pressure = rotated_field[:, :, 2] * 2
+        transverse_pressure = gas_pressure + rotated_field[:, :, 2] * 2
         potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
         potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
 
-        inflection_point_counts, inflection_points = _find_inflection_points(potential)
+        inflection_points = potential.abs().argmax(dim=1)
 
-        folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
-                                               potential, threshold_folding)
-
-        rdiff_magnetic = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
-        rdiff_gas = _calculate_residue_diff(inflection_points, potential, batch_gas_pressure)
-        rdiff = (rdiff_magnetic + rdiff_gas) / 2
+        rdiff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
 
         argmin = torch.argmin(rdiff)
         if best_rdiff is None or rdiff[argmin] < best_rdiff:
