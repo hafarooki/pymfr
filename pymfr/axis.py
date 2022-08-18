@@ -6,7 +6,7 @@ from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _cal
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, frame_velocity, iterations=3,
+def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3,
                    threshold_folding=0.5):
     """
     WIP API for finding best axis using Rdiff as a criteria
@@ -23,6 +23,7 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=3,
     for i in range(iterations):
         batch_field = magnetic_field.unsqueeze(0).expand(len(batch_axes), -1, -1)
         batch_frames = frame_velocity.unsqueeze(0).expand(len(batch_axes), -1)
+        batch_gas_pressure = gas_pressure.unsqueeze(0).expand(len(batch_axes), -1)
 
         rotated_field = _rotate_field(batch_axes, batch_field, batch_frames)
         transverse_pressure = rotated_field[:, :, 2] * 2
@@ -34,12 +35,14 @@ def minimize_rdiff(magnetic_field, frame_velocity, iterations=3,
         folding_mask = _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
                                                potential, threshold_folding)
 
-        rdiff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
+        rdiff_magnetic = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
+        rdiff_gas = _calculate_residue_diff(inflection_points, potential, batch_gas_pressure)
+        rdiff = (rdiff_magnetic + rdiff_gas) / 2
 
-        for j in torch.nonzero(folding_mask).flatten():
-            if best_rdiff is None or rdiff[j] < best_rdiff:
-                best_axis = batch_axes[j]
-                best_rdiff = rdiff[j]
+        argmin = torch.argmin(rdiff)
+        if best_rdiff is None or rdiff[argmin] < best_rdiff:
+            best_axis = batch_axes[argmin]
+            best_rdiff = rdiff[argmin]
 
         if best_axis is None:
             break
