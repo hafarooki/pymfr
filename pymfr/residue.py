@@ -18,17 +18,20 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     min_pressure, max_pressure = torch.aminmax(pressure, dim=1)
     pressure_range = max_pressure - min_pressure
 
+    potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
+
     # second dim is potential1, pressure1, potential2, pressure2
     folded_data = torch.concat((potential.unsqueeze(1), pressure.unsqueeze(1)), dim=1).repeat(1, 2, 1)
+    duration = folded_data.shape[2]
 
-    all_indices = torch.arange(folded_data.shape[2], device=inflection_points.device)
+    all_indices = torch.arange(duration, device=inflection_points.device)
     all_indices = all_indices.unsqueeze(0).unsqueeze(1).expand(folded_data.shape[0], 2, -1)
     before = all_indices < inflection_points.unsqueeze(1).unsqueeze(2)
     after = all_indices > inflection_points.unsqueeze(1).unsqueeze(2)
 
     indices = torch.arange(len(folded_data), device=folded_data.device)
     inflection_point_values = folded_data[indices, :2, inflection_points]
-    inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, folded_data.shape[2])
+    inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, duration)
 
     # in first half, values after inflection point should be the inflection points repeated
     folded_data[:, :2, :] = torch.where(after, inflection_point_values, folded_data[:, :2, :])
@@ -52,10 +55,16 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
                                    y=folded_data[:, 3, :],
                                    xnew=interp_potential)
 
-    interp_diff = interpolated1 - interpolated2
+    limit = torch.clamp(folded_data[:, 2, 0], min=0)
+    limit_mask = interp_potential >= limit.unsqueeze(1)
+    interp_diff = torch.where(limit_mask, (interpolated1 - interpolated2) ** 2, 0)
 
-    error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1) / 2) / pressure_range
-    return error_diff
+    # normalize by number of data points (subtract one to exclude inflection point)
+    sample_counts = limit_mask.long().sum(dim=1) - 1
+    interp_diff = torch.where(sample_counts.unsqueeze(1) > 1, interp_diff, torch.inf)
+
+    error_diff = torch.sqrt(torch.sum(interp_diff, dim=1) / (sample_counts * 2)) / pressure_range
+    return torch.where(pressure_range > 0, error_diff, torch.inf)
 
 
 def _calculate_residue_fit(potential_array,

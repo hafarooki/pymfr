@@ -3,65 +3,50 @@ import scipy.constants
 import torch
 import torch.nn.functional as F
 
+from pymfr.folding import _find_single_inflection_points
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, iterations=3):
+def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, trial_axes):
     """
     WIP API for finding best axis using Rdiff as a criteria
-    :param magnetic_field:
-    :param frame_velocity:
-    :param iterations:
-    :return:
     """
 
-    best_axis = None
-    best_rdiff = None
+    batch_size = magnetic_field.shape[:-2]
+    duration = magnetic_field.shape[-2]
+    n_trial_axes = len(trial_axes)
 
-    batch_axes = _get_trial_axes(range(0, 90, 1), range(0, 360, 2)).to(magnetic_field.device)
-    for i in range(iterations):
-        batch_field = magnetic_field.unsqueeze(0).expand(len(batch_axes), -1, -1)
-        batch_frames = frame_velocity.unsqueeze(0).expand(len(batch_axes), -1)
-        batch_gas_pressure = gas_pressure.unsqueeze(0).expand(len(batch_axes), -1)
+    assert magnetic_field.device == gas_pressure.device == frame_velocity.device == trial_axes.device
+    assert magnetic_field.shape == (*batch_size, duration, 3)
+    assert gas_pressure.shape == (*batch_size, duration)
+    assert frame_velocity.shape == (*batch_size, 3)
+    assert trial_axes.shape == (*batch_size, n_trial_axes, 3)
 
-        rotated_field = _rotate_field(batch_axes, batch_field, batch_frames)
-        transverse_pressure = batch_gas_pressure + (rotated_field[:, :, 2] * 1e-9) ** 2 / (2 * scipy.constants.mu_0) * 1e9
-        potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
-        potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
+    device = magnetic_field.device
 
-        inflection_points = potential.abs().argmax(dim=1)
+    trial_field = magnetic_field.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1, -1)
+    trial_frame = frame_velocity.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
+    trial_gas_pressure = gas_pressure.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
 
-        peaks = transverse_pressure[torch.arange(transverse_pressure.shape[0], device=transverse_pressure.device),
-                                    inflection_points]
-        min_pressure, max_pressure = torch.aminmax(transverse_pressure, dim=1)
-        thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
+    rotated_field = _rotate_field(trial_axes.reshape(-1, 3),
+                                  trial_field.reshape(-1, duration, 3),
+                                  trial_frame.reshape(-1, 3)).reshape(*batch_size, n_trial_axes, duration, 3)
 
-        mask = (inflection_points > 0) & \
-               (inflection_points < (potential.shape[-1] - 1)) & \
-               (peaks > thresholds) & \
-               ((potential.abs()[:, -1] / potential.abs().amax(dim=1)) < 0.1) & \
-               ((max_pressure - min_pressure) > 0)
+    transverse_pressure = trial_gas_pressure + (rotated_field[..., 2] * 1e-9) ** 2 / (2 * scipy.constants.mu_0) * 1e9
+    potential = torch.zeros((len(rotated_field)), rotated_field.shape[-2], device=device)
+    potential[..., 1:] = torch.cumulative_trapezoid(rotated_field[..., 1])
 
-        rdiff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
-        rdiff = torch.where(mask, rdiff, torch.inf)
+    inflection_points, inflection_points_valid = _find_single_inflection_points(potential)
+    trim_percent = potential[..., -1].abs() / potential.abs().amax(dim=-1)
+    inflection_points_valid &= (trim_percent < 0.5)
 
-        argmin = torch.argmin(rdiff)
-        if best_rdiff is None or rdiff[argmin] < best_rdiff:
-            if rdiff[argmin] < torch.inf:
-                best_axis = batch_axes[argmin]
-                best_rdiff = rdiff[argmin]
+    rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
+                                    potential.reshape(-1, duration),
+                                    transverse_pressure.reshape(-1, duration)).reshape(*batch_size, n_trial_axes)
+    rdiff = torch.where(inflection_points_valid, rdiff, torch.inf)
 
-        if best_axis is None:
-            break
-
-        x, y, z = tuple(best_axis.cpu().numpy())
-        altitude = np.rad2deg(np.arctan2(np.sqrt(x ** 2 + y ** 2), z))
-        azimuth = np.rad2deg(np.arctan2(y, x))
-        batch_axes = _get_trial_axes(np.linspace(altitude - 30 / (i + 1), altitude + 30 / (i + 1), 50),
-                                     np.linspace(azimuth - 60 / (i + 1), azimuth + 60 / (i + 1), 50))
-        batch_axes = batch_axes.to(magnetic_field.device)
-
-    return best_axis, best_rdiff
+    argmin = torch.argmin(rdiff, dim=-1)
+    return trial_axes[argmin], rdiff[argmin]
 
 
 def _get_trial_axes(altitude_range, azimuth_range):
@@ -77,7 +62,8 @@ def _get_trial_axes(altitude_range, azimuth_range):
 
 def _rotate_field(batch_axes, batch_field, batch_frames):
     z_unit = batch_axes
-    x_unit = F.normalize(-(batch_frames - (batch_frames * z_unit).sum(dim=1).unsqueeze(1) * z_unit))
+    projected = (batch_frames * z_unit).sum(dim=1).unsqueeze(1) * z_unit
+    x_unit = F.normalize(-(batch_frames - projected))
     y_unit = torch.cross(z_unit, x_unit)
     rotation_matrix = torch.stack([x_unit, y_unit, z_unit], dim=2)
     rotation_matrix = rotation_matrix.transpose(1, 2)  # transpose gives inverse of rotation matrix
