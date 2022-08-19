@@ -24,7 +24,7 @@ def _find_single_inflection_points(potential):
 
 def _smooth(potential):
     duration = potential.shape[1]
-    kernel_size = duration // 4 // 2 * 2 + 1  # divide by 4, floor, round up to nearest odd
+    kernel_size = duration // 16 // 2 * 2 + 1  # divide by 16, floor, round up to nearest odd
     if kernel_size > 1:
         smoothed = F.avg_pool1d(potential,
                                 kernel_size=kernel_size,
