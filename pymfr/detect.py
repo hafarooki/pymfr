@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.constants
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
@@ -16,6 +17,7 @@ from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit
 def detect_flux_ropes(magnetic_field,
                       velocity,
                       density,
+                      gas_pressure,
                       batch_size_mb,
                       window_lengths,
                       window_steps,
@@ -73,7 +75,7 @@ def detect_flux_ropes(magnetic_field,
     In the future this should be replaced with a list of specialized objects or a dataframe.
     """
 
-    tensor = _pack_data(magnetic_field, velocity, density)
+    tensor = _pack_data(magnetic_field, velocity, density, gas_pressure)
 
     trial_axes = _get_trial_axes(altitude_range, azimuth_range)
     if cuda:
@@ -129,7 +131,9 @@ def detect_flux_ropes(magnetic_field,
             potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
             potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
 
-            transverse_pressure = rotated_field[:, :, 2] ** 2
+            batch_gas_pressure = batch_data[:, :, 9]
+            transverse_magnetic_pressure = (rotated_field[:, :, 2] * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
+            transverse_pressure = batch_gas_pressure + transverse_magnetic_pressure
 
             alfvenicity_mask = alfvenicity <= threshold_walen
 
@@ -189,20 +193,22 @@ def detect_flux_ropes(magnetic_field,
     return list(sorted(remaining_events, key=lambda x: x[1]))
 
 
-def _pack_data(magnetic_field, velocity, density):
+def _pack_data(magnetic_field, velocity, density, gas_pressure):
     # all arrays must have the same number of samples
     n_sample = len(magnetic_field)
-    assert n_sample == len(magnetic_field) == len(velocity) == len(density)
+    assert n_sample == len(magnetic_field) == len(velocity) == len(density) == len(gas_pressure)
 
     # ensure all arrays have the correct shapes
     assert magnetic_field.shape == (n_sample, 3)
     assert velocity.shape == (n_sample, 3)
     assert density.shape == (n_sample,)
+    assert gas_pressure.shape == (n_sample,)
 
     # convert all arrays to tensor so that numpy arrays can be given
     magnetic_field = torch.as_tensor(magnetic_field)
     velocity = torch.as_tensor(velocity)
     density = torch.as_tensor(density)
+    gas_pressure = torch.as_tensor(gas_pressure).unsqueeze(1)
 
     # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
     # constant factor 21.8114 assumes B is in nT and n_p is in cm^-3
@@ -210,7 +216,7 @@ def _pack_data(magnetic_field, velocity, density):
     alfven_velocity = (magnetic_field[:, :3] / torch.sqrt(density.unsqueeze(1))).flatten(1) * 21.8114
 
     # combine needed data into one tensor
-    return torch.concat([magnetic_field, velocity, alfven_velocity], dim=1)
+    return torch.concat([magnetic_field, velocity, alfven_velocity, gas_pressure], dim=1)
 
 
 def _get_sliding_windows(window_lengths, window_steps):
