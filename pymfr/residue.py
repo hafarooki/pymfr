@@ -18,6 +18,7 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     min_pressure, max_pressure = torch.aminmax(pressure, dim=1)
     pressure_range = max_pressure - min_pressure
 
+    # force to be positive at peak
     potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
 
     # second dim is potential1, pressure1, potential2, pressure2
@@ -47,24 +48,25 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     folded_data[:, 2, :] = folded_data[:, 2, :].gather(1, sort2)
     folded_data[:, 3, :] = folded_data[:, 3, :].gather(1, sort2)
 
-    interp_potential = torch.sort(potential, dim=1)[0]
+    # scale x axis from 0 to 1
+    minimum_values = torch.clamp(folded_data[:, 2, :].amin(dim=1, keepdim=True), min=0)
+    folded_data[:, 0, :] -= minimum_values
+    folded_data[:, 2, :] -= minimum_values
+    peak_values = folded_data[:, 2, :].amax(dim=-1, keepdim=True)
+    folded_data[:, 0, :] /= peak_values
+    folded_data[:, 2, :] /= peak_values
+
+    potential_interp = torch.linspace(0, 1, duration // 2, device=folded_data.device)
+    potential_interp = potential_interp.unsqueeze(0).expand(folded_data.shape[0], -1)
     interpolated1 = interp.forward(x=folded_data[:, 0, :],
                                    y=folded_data[:, 1, :],
-                                   xnew=interp_potential)
+                                   xnew=potential_interp)
     interpolated2 = interp.forward(x=folded_data[:, 2, :],
                                    y=folded_data[:, 3, :],
-                                   xnew=interp_potential)
+                                   xnew=potential_interp)
     interp_diff = (interpolated1 - interpolated2) ** 2
 
-    limit = torch.clamp(folded_data[:, 2, 0], min=0)
-    limit_mask = interp_potential >= limit.unsqueeze(1)
-    interp_diff = torch.where(limit_mask, interp_diff, 0)
-
-    # normalize by number of data points (subtract one to exclude inflection point)
-    sample_counts = limit_mask.long().sum(dim=1) - 1
-    interp_diff = torch.where(sample_counts.unsqueeze(1) > 1, interp_diff, torch.inf)
-
-    error_diff = torch.sqrt(torch.sum(interp_diff, dim=1) / (sample_counts * 2)) / pressure_range
+    error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / pressure_range
     return torch.where(pressure_range > 0, error_diff, torch.inf)
 
 

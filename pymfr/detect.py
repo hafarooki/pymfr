@@ -137,7 +137,7 @@ def detect_flux_ropes(magnetic_field,
 
             alfvenicity_mask = alfvenicity <= threshold_walen
 
-            inflection_point_counts, inflection_points = _find_inflection_points(potential)
+            inflection_points, inflection_point_counts = _find_inflection_points(potential)
 
             folding_mask = _calculate_folding_mask(inflection_points,
                                                    inflection_point_counts,
