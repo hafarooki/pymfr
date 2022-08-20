@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 
 def _find_inflection_points(potential):
-    inflection_points = potential.amax(dim=1)
+    inflection_points = potential.abs().amax(dim=1)
 
     smoothed = _smooth(potential)
 
@@ -15,7 +15,7 @@ def _find_inflection_points(potential):
 
 def _find_single_inflection_points(potential):
     duration = potential.shape[-1]
-    inflection_points = potential.argmax(dim=-1)
+    inflection_points = potential.abs().argmax(dim=-1)
 
     inflection_points_valid = (inflection_points >= 0) & (inflection_points <= duration - 1)
     return inflection_points, inflection_points_valid
