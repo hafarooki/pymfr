@@ -13,12 +13,12 @@ def _find_inflection_points(potential):
 
 
 def _find_single_inflection_points(potential):
-    smoothed = _smooth(potential)
-    sign_change = torch.diff(torch.sign(torch.diff(smoothed)))
-    sign_change_values = torch.where(sign_change != 0, potential[..., 2:].abs(), 0)
-    inflection_points = sign_change_values.argmax(dim=-1) + 1
+    duration = potential.shape[-1]
+    inflection_points = potential.argmax(dim=-1)
 
-    inflection_points_valid = sign_change_values.amax(dim=-1) > 0
+    lower_bound = duration // 4
+    upper_bound = duration - duration // 4
+    inflection_points_valid = (inflection_points >= lower_bound) & (inflection_points <= upper_bound)
     return inflection_points, inflection_points_valid
 
 
@@ -35,7 +35,6 @@ def _smooth(potential):
     else:
         smoothed = potential
     return smoothed
-
 
 
 def _calculate_folding_mask(inflection_points, inflection_point_counts, transverse_pressure,
