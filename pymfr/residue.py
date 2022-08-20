@@ -67,7 +67,15 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     interp_diff = (interpolated1 - interpolated2) ** 2
 
     error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / pressure_range
-    return torch.where(pressure_range > 0, error_diff, torch.inf)
+
+    # infinity if 0 pressure range
+    error_diff = torch.where(pressure_range > 0, error_diff, torch.inf)
+
+    # require at least half of duration after trimming
+    error_diff = torch.where((potential >= minimum_values).long().sum(dim=1) >= duration // 2,
+                             error_diff, torch.inf)
+
+    return error_diff
 
 
 def _calculate_residue_fit(potential_array,

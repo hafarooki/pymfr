@@ -44,11 +44,9 @@ def get_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes):
     potential[..., 1:] = torch.cumulative_trapezoid(rotated_field[..., 1])
     inflection_points = _find_single_inflection_points(potential.reshape(-1, duration))
     inflection_points = inflection_points.reshape(potential.shape[:-1])
-    trim_percent = potential[..., -1].abs() / potential.abs().amax(dim=-1)
     rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
                                     potential.reshape(-1, duration),
                                     transverse_pressure.reshape(-1, duration)).reshape(*batch_size, n_trial_axes)
-    rdiff = torch.where(trim_percent < (trim_percent.amin(dim=-1, keepdim=True) * 2), rdiff, torch.inf)
     return rdiff
 
 
