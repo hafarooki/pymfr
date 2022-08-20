@@ -3,11 +3,12 @@ import torch.nn.functional as F
 
 
 def _find_inflection_points(potential):
+    inflection_points = potential.amax(dim=1)
+
     smoothed = _smooth(potential)
 
     points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
 
-    inflection_points = points.argmax(dim=1) + 1
     inflection_point_counts = points.sum(dim=1)
     return inflection_point_counts, inflection_points
 
