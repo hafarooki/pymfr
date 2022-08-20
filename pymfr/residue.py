@@ -54,10 +54,11 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     interpolated2 = interp.forward(x=folded_data[:, 2, :],
                                    y=folded_data[:, 3, :],
                                    xnew=interp_potential)
+    interp_diff = (interpolated1 - interpolated2) ** 2
 
     limit = torch.clamp(folded_data[:, 2, 0], min=0)
     limit_mask = interp_potential >= limit.unsqueeze(1)
-    interp_diff = torch.where(limit_mask, (interpolated1 - interpolated2) ** 2, 0)
+    interp_diff = torch.where(limit_mask, interp_diff, 0)
 
     # normalize by number of data points (subtract one to exclude inflection point)
     sample_counts = limit_mask.long().sum(dim=1) - 1

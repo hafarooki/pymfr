@@ -16,9 +16,7 @@ def _find_single_inflection_points(potential):
     duration = potential.shape[-1]
     inflection_points = potential.argmax(dim=-1)
 
-    lower_bound = duration // 4
-    upper_bound = duration - duration // 4
-    inflection_points_valid = (inflection_points >= lower_bound) & (inflection_points <= upper_bound)
+    inflection_points_valid = (inflection_points >= 0) & (inflection_points <= duration - 1)
     return inflection_points, inflection_points_valid
 
 
