@@ -56,7 +56,7 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     folded_data[:, 0, :] /= peak_values
     folded_data[:, 2, :] /= peak_values
 
-    potential_interp = torch.linspace(0, 1, duration // 2, device=folded_data.device)
+    potential_interp = torch.linspace(0, 1, 32, device=folded_data.device)
     potential_interp = potential_interp.unsqueeze(0).expand(folded_data.shape[0], -1)
     interpolated1 = interp.forward(x=folded_data[:, 0, :],
                                    y=folded_data[:, 1, :],
