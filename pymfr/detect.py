@@ -28,7 +28,6 @@ def detect_flux_ropes(magnetic_field,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
-                      threshold_folding=0.05,
                       cuda=True):
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
@@ -63,13 +62,12 @@ def detect_flux_ropes(magnetic_field,
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
-    :param threshold_folding: % of maximum the final value of the A_y array.
     0 would mean it has to be 0, 1 would mean it can be equal to the maximum value.
     This threshold is unique to this implementation--the original paper trims the window instead,
     which is not trivial to do with the efficient vectorized computations of this implementation.
     The threshold should be close enough to 0 so that we satisfy the assumption that
     we crossed the flux boundary twice, high enough to account for uncertainties in the measurements
-    and calculations. By default, it is 0.05.
+    and calculations. By default, it is 0.5.
     :param cuda: Whether to use the GPU
     :return: A list of tuples.
     In the future this should be replaced with a list of specialized objects or a dataframe.
@@ -142,8 +140,7 @@ def detect_flux_ropes(magnetic_field,
             folding_mask = _calculate_folding_mask(inflection_points,
                                                    inflection_point_counts,
                                                    transverse_pressure,
-                                                   potential,
-                                                   threshold_folding)
+                                                   potential)
 
             mask = alfvenicity_mask & folding_mask
 
