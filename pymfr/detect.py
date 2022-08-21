@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 import tqdm as tqdm
 
-from pymfr.axis import _get_trial_axes, _rotate_field
+from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
 from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _calculate_trim_mask
-from pymfr.frame import _find_frames
+from pymfr.frame import estimate_ht_frame, estimate_ht2d_frame
 
 from pymfr.walen_test import _calculate_alfvenicity
 
@@ -120,7 +120,13 @@ def detect_flux_ropes(magnetic_field,
                 continue
 
             batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], trial_axes, frame_type)
-            batch_data, batch_starts = _resize(batch_data, batch_starts, trial_axes)
+
+            error_diff = calculate_residue_map(batch_data[:, :, :3], batch_data[:, :, 9], batch_frames, batch_axes)
+
+            error_diff, argmin = error_diff.min(dim=-1)
+            index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
+            batch_axes = batch_axes.gather(-2, index).squeeze(-2)
+            batch_frames = batch_frames.gather(-2, index).squeeze(-2)
 
             alfvenicity = _calculate_alfvenicity(batch_frames, batch_data)
 
@@ -142,23 +148,7 @@ def detect_flux_ropes(magnetic_field,
                                                    transverse_pressure,
                                                    potential)
 
-            mask = alfvenicity_mask & folding_mask
-
-            if torch.count_nonzero(mask) == 0:
-                continue
-
-            inflection_points = inflection_points[mask]
-            potential = potential[mask]
-            transverse_pressure = transverse_pressure[mask]
-            batch_axes = batch_axes[mask]
-            batch_frames = batch_frames[mask]
-            batch_starts = batch_starts[mask]
-
-            error_diff = _calculate_residue_diff(inflection_points,
-                                                 potential,
-                                                 transverse_pressure)
-
-            mask = (error_diff <= threshold_diff)
+            mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff)
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
@@ -188,6 +178,27 @@ def detect_flux_ropes(magnetic_field,
         _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit)
 
     return list(sorted(remaining_events, key=lambda x: x[1]))
+
+
+def _find_frames(magnetic_field, velocity, trial_axes, frame_type):
+    n_batch = len(magnetic_field)
+    batch_axes = trial_axes.unsqueeze(0).expand(n_batch, -1, -1)
+
+    electric_field = -torch.cross(velocity, magnetic_field, dim=2)
+
+    n_trial_axis = len(trial_axes)
+
+    if frame_type == "mean_velocity":
+        batch_frames = velocity.mean(dim=1).unsqueeze(1).expand(-1, n_trial_axis, -1)
+    elif frame_type == "vht_2d":
+        batch_frames = estimate_ht2d_frame(magnetic_field, electric_field, batch_axes)
+    elif frame_type == "vht":
+        vht = estimate_ht_frame(magnetic_field, electric_field)
+        batch_frames = vht.unsqueeze(1).expand(-1, n_trial_axis, -1)
+    else:
+        raise Exception(f"Unknown frame type {frame_type}")
+
+    return batch_frames, batch_axes
 
 
 def _pack_data(magnetic_field, velocity, density, gas_pressure):

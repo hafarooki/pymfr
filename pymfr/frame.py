@@ -101,28 +101,3 @@ def _covariance(a, b):
         for j in range(3):
             matrix[..., i, j] = (d_a[..., i] * d_b[..., j]).mean(dim=-1)
     return matrix
-
-
-def _find_frames(magnetic_field, velocity, trial_axes, frame_type):
-    n_batch = len(magnetic_field)
-    batch_axes = torch.repeat_interleave(trial_axes, repeats=n_batch, dim=0)
-
-    electric_field = -torch.cross(velocity, magnetic_field, dim=2)
-
-    if frame_type == "mean_velocity":
-        batch_frames = velocity.mean(dim=1).repeat(len(trial_axes), 1)
-    elif frame_type == "vht_2d":
-        axes = trial_axes.unsqueeze(0).expand(n_batch, -1, -1)
-        batch_frames = estimate_ht2d_frame(magnetic_field, electric_field, axes)
-
-        # output will be (batch, axis, 3), but we made each axis repeated "batch" times,
-        # so the same axis should be repeated and the batch should change every entry,
-        # so before flattening, need to transpose
-        batch_frames = batch_frames.transpose(0, 1).reshape(-1, 3)
-    elif frame_type == "vht":
-        vht = estimate_ht_frame(magnetic_field, electric_field)
-        batch_frames = vht.repeat(len(trial_axes), 1)
-    else:
-        raise Exception(f"Unknown frame type {frame_type}")
-
-    return batch_frames, batch_axes

@@ -38,9 +38,14 @@ def _calculate_folding_mask(inflection_points, inflection_point_counts, transver
                             potential):
     peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                 inflection_points]
+
+    # force to be positive at peak
+    potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
+
     min_pressure, max_pressure = torch.aminmax(transverse_pressure, dim=1)
     thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
-    mask = (potential[:, -1].abs() <= potential[..., 1].abs()) & \
+    mask = (potential[:, -1] <= potential[..., 1]) & \
+           (potential[:, -1] >= 0) & \
            (inflection_point_counts == 1) & \
            (peaks > thresholds) & \
            (max_pressure - min_pressure > 0)

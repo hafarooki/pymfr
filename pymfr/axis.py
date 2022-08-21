@@ -12,14 +12,14 @@ def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, trial_axes):
     WIP API for finding best axis using Rdiff as a criteria
     """
 
-    rdiff = get_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes)
+    rdiff = calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes)
     rdiff, argmin = rdiff.min(dim=-1)
     index = argmin.unsqueeze(-1).unsqueeze(-1).expand(*[-1] * len(magnetic_field.shape[:-2]), -1, 3)
     trial_axes = trial_axes.gather(-2, index).squeeze(-2)
     return trial_axes, rdiff
 
 
-def get_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes):
+def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes):
     """
     WIP API
     """
@@ -30,11 +30,14 @@ def get_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes):
     assert magnetic_field.device == gas_pressure.device == frame_velocity.device == trial_axes.device
     assert magnetic_field.shape == (*batch_size, duration, 3)
     assert gas_pressure.shape == (*batch_size, duration)
-    assert frame_velocity.shape == (*batch_size, 3)
+    assert frame_velocity.shape == (*batch_size, 3) or frame_velocity.shape == (*batch_size, n_trial_axes, 3)
     assert trial_axes.shape == (*batch_size, n_trial_axes, 3)
     device = magnetic_field.device
     trial_field = magnetic_field.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1, -1)
-    trial_frame = frame_velocity.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
+    if frame_velocity.shape == (*batch_size, ):
+        trial_frame = frame_velocity.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
+    else:
+        trial_frame = frame_velocity
     trial_gas_pressure = gas_pressure.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
     rotated_field = _rotate_field(trial_axes.reshape(-1, 3),
                                   trial_field.reshape(-1, duration, 3),
