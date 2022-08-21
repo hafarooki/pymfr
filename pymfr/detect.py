@@ -146,7 +146,8 @@ def detect_flux_ropes(magnetic_field,
             folding_mask = _calculate_folding_mask(inflection_points,
                                                    inflection_point_counts,
                                                    transverse_pressure,
-                                                   potential)
+                                                   potential,
+                                                   window_step)
 
             mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff)
 
