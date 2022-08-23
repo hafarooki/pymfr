@@ -5,7 +5,7 @@ import numpy as np
 interp = Interp1d()
 
 
-def _calculate_residue_diff(inflection_points, potential, pressure):
+def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=None):
     assert len(inflection_points.shape) == 1
     assert len(potential.shape) == 2
     assert len(pressure.shape) == 2
@@ -56,7 +56,7 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     folded_data[:, 0, :] /= peak_values
     folded_data[:, 2, :] /= peak_values
 
-    potential_interp = torch.linspace(0, 1, 32, device=folded_data.device)
+    potential_interp = torch.linspace(0, 1, duration, device=folded_data.device)
     potential_interp = potential_interp.unsqueeze(0).expand(folded_data.shape[0], -1)
     interpolated1 = interp.forward(x=folded_data[:, 0, :],
                                    y=folded_data[:, 1, :],
@@ -72,9 +72,17 @@ def _calculate_residue_diff(inflection_points, potential, pressure):
     error_diff = torch.where(pressure_range > 0, error_diff, torch.inf)
 
     # require at least 1/4 duration on each branch after trimming
-    error_diff = torch.where((((potential >= minimum_values) & before).long().sum(dim=1) >= duration // 4)
-                             & (((potential >= minimum_values) & after).long().sum(dim=1) >= duration // 4),
-                             error_diff, torch.inf)
+    max_clip = max_clip if max_clip is not None else duration // 2
+    unclipped_mask = potential >= minimum_values
+    error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)
+                             & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
+                             & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
+                              ), error_diff, torch.inf)
+
+    # peak pressure must be on top
+    peak_pressure = pressure.gather(1, inflection_points.unsqueeze(1)).squeeze(1)
+    average_pressure = pressure.quantile(0.85, dim=1)
+    error_diff = torch.where(peak_pressure > average_pressure, error_diff, torch.inf)
 
     return error_diff
 

@@ -7,19 +7,19 @@ from pymfr.folding import _find_single_inflection_points
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, trial_axes):
+def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=None):
     """
     WIP API for finding best axis using Rdiff as a criteria
     """
 
-    rdiff = calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes)
+    rdiff = calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=max_clip)
     rdiff, argmin = rdiff.min(dim=-1)
     index = argmin.unsqueeze(-1).unsqueeze(-1).expand(*[-1] * len(magnetic_field.shape[:-2]), -1, 3)
     trial_axes = trial_axes.gather(-2, index).squeeze(-2)
     return trial_axes, rdiff
 
 
-def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes):
+def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=None):
     """
     WIP API
     """
@@ -34,7 +34,7 @@ def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_ax
     assert trial_axes.shape == (*batch_size, n_trial_axes, 3)
     device = magnetic_field.device
     trial_field = magnetic_field.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1, -1)
-    if frame_velocity.shape == (*batch_size, ):
+    if frame_velocity.shape == (*batch_size, 3):
         trial_frame = frame_velocity.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
     else:
         trial_frame = frame_velocity
@@ -49,7 +49,8 @@ def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_ax
     inflection_points = inflection_points.reshape(potential.shape[:-1])
     rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
                                     potential.reshape(-1, duration),
-                                    transverse_pressure.reshape(-1, duration)).reshape(*batch_size, n_trial_axes)
+                                    transverse_pressure.reshape(-1, duration),
+                                    max_clip).reshape(*batch_size, n_trial_axes)
     return rdiff
 
 

@@ -1,17 +1,14 @@
-import matplotlib.pyplot as plt
 import numpy as np
-import scipy.constants
 import torch
-import torch.nn.functional as F
 import tqdm as tqdm
 
 from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
-from pymfr.folding import _find_inflection_points, _calculate_folding_mask, _calculate_trim_mask
+from pymfr.folding import _find_inflection_points
 from pymfr.frame import estimate_ht_frame, estimate_ht2d_frame
 
 from pymfr.walen_test import _calculate_alfvenicity
 
-from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit
+from pymfr.residue import _calculate_residue_fit
 
 
 def detect_flux_ropes(magnetic_field,
@@ -121,7 +118,8 @@ def detect_flux_ropes(magnetic_field,
 
             batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], trial_axes, frame_type)
 
-            error_diff = calculate_residue_map(batch_data[:, :, :3], batch_data[:, :, 9], batch_frames, batch_axes)
+            error_diff = calculate_residue_map(batch_data[:, :, :3], batch_data[:, :, 9], batch_frames, batch_axes,
+                                               max_clip=window_step)
 
             error_diff, argmin = error_diff.min(dim=-1)
             index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
@@ -143,11 +141,11 @@ def detect_flux_ropes(magnetic_field,
 
             inflection_points, inflection_point_counts = _find_inflection_points(potential)
 
-            folding_mask = _calculate_folding_mask(inflection_points,
-                                                   inflection_point_counts,
-                                                   transverse_pressure,
-                                                   potential,
-                                                   window_step)
+            peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
+                                        inflection_points]
+            thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
+            folding_mask = (inflection_point_counts == 1) & \
+                           (peaks > thresholds)
 
             mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff)
 
