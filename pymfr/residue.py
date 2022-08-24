@@ -15,9 +15,6 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
 
     interp = Interp1d()
 
-    min_pressure, max_pressure = torch.aminmax(pressure, dim=1)
-    pressure_range = max_pressure - min_pressure
-
     # force to be positive at peak
     potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
 
@@ -50,6 +47,8 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
 
     # scale x axis from 0 to 1
     minimum_values = torch.clamp(folded_data[:, 2, :].amin(dim=1, keepdim=True), min=0)
+    unclipped_mask = potential >= minimum_values
+
     folded_data[:, 0, :] -= minimum_values
     folded_data[:, 2, :] -= minimum_values
     peak_values = folded_data[:, 2, :].amax(dim=-1, keepdim=True)
@@ -66,6 +65,9 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
                                    xnew=potential_interp)
     interp_diff = (interpolated1 - interpolated2) ** 2
 
+    pressure_clipped = torch.where(unclipped_mask, pressure, pressure.mean(dim=1, keepdim=True))
+    min_pressure, max_pressure = torch.aminmax(pressure_clipped * unclipped_mask, dim=1)
+    pressure_range = max_pressure - min_pressure
     error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / pressure_range
 
     # infinity if 0 pressure range
@@ -73,10 +75,9 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
 
     # require at least 1/4 duration on each branch after trimming
     max_clip = max_clip if max_clip is not None else duration // 2
-    unclipped_mask = potential >= minimum_values
     error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)
-                             & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
-                             & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
+                              & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
+                              & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
                               ), error_diff, torch.inf)
 
     # peak pressure must be on top
