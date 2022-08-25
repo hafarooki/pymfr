@@ -66,7 +66,7 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
     interp_diff = (interpolated1 - interpolated2) ** 2
 
     pressure_clipped = torch.where(unclipped_mask, pressure, pressure.mean(dim=1, keepdim=True))
-    min_pressure, max_pressure = torch.aminmax(pressure_clipped * unclipped_mask, dim=1)
+    min_pressure, max_pressure = torch.aminmax(pressure_clipped, dim=1)
     pressure_range = max_pressure - min_pressure
     error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / pressure_range
 
