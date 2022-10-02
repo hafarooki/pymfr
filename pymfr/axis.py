@@ -3,7 +3,6 @@ import scipy.constants
 import torch
 import torch.nn.functional as F
 
-from pymfr.folding import _find_single_inflection_points
 from pymfr.residue import _calculate_residue_diff
 
 
@@ -45,8 +44,7 @@ def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_ax
     transverse_pressure = trial_gas_pressure + (rotated_field[..., 2] * 1e-9) ** 2 / (2 * scipy.constants.mu_0) * 1e9
     potential = torch.zeros(rotated_field.shape[:-1], device=device)
     potential[..., 1:] = torch.cumulative_trapezoid(rotated_field[..., 1])
-    inflection_points = _find_single_inflection_points(potential.reshape(-1, duration))
-    inflection_points = inflection_points.reshape(potential.shape[:-1])
+    inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
     rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
                                     potential.reshape(-1, duration),
                                     transverse_pressure.reshape(-1, duration),

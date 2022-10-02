@@ -3,10 +3,7 @@ import torch
 import tqdm as tqdm
 
 from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
-from pymfr.folding import _find_inflection_points
 from pymfr.frame import estimate_ht_frame, estimate_ht2d_frame
-
-from pymfr.walen_test import _calculate_alfvenicity
 
 from pymfr.residue import _calculate_residue_fit
 
@@ -270,3 +267,43 @@ def _cleanup_candidates(contains_existing, event_candidates, remaining_events, t
                 continue
 
             del event_candidates[other_key]
+
+
+def _calculate_alfvenicity(frame, windows):
+    remaining_flow = (windows[:, :, 3:6] - frame.unsqueeze(1)).squeeze(1).flatten(1)
+    alfven_velocity = windows[:, :, 6:9].flatten(1)
+    d_flow = remaining_flow - remaining_flow.mean(dim=1, keepdim=True)
+    d_alfven = alfven_velocity - alfven_velocity.mean(dim=1, keepdim=True)
+    walen_slope = (d_flow * d_alfven).sum(dim=1) / (d_alfven ** 2).sum(dim=1)
+    return torch.abs(walen_slope)
+
+
+def _find_inflection_points(potential):
+    inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
+
+    smoothed = _smooth(potential)
+
+    points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
+
+    inflection_point_counts = points.sum(dim=1).long()
+    return inflection_points, inflection_point_counts
+
+
+def _smooth(potential):
+    duration = potential.shape[1]
+    kernel_size = duration // 16 // 2 * 2 + 1  # divide by 16, floor, round up to nearest odd
+    if kernel_size > 1:
+        smoothed = F.avg_pool1d(potential,
+                                kernel_size=kernel_size,
+                                stride=1,
+                                padding=(kernel_size - 1) // 2,
+                                count_include_pad=False)
+        assert smoothed.shape[1] == duration
+    else:
+        smoothed = potential
+    return smoothed
+
+
+def _calculate_trim_mask(potential, threshold_folding):
+    trim_mask = (potential[:, -1].abs() / potential.abs().amax(dim=1)) < threshold_folding
+    return trim_mask
