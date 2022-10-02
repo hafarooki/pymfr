@@ -1,5 +1,7 @@
 import numpy as np
+import pandas as pd
 import torch
+import torch.nn.functional as F
 import tqdm as tqdm
 
 from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
@@ -63,8 +65,7 @@ def detect_flux_ropes(magnetic_field,
     we crossed the flux boundary twice, high enough to account for uncertainties in the measurements
     and calculations. By default, it is 0.5.
     :param cuda: Whether to use the GPU
-    :return: A list of tuples.
-    In the future this should be replaced with a list of specialized objects or a dataframe.
+    :return: A DataFrame describing the detected flux ropes.
     """
 
     tensor = _pack_data(magnetic_field, velocity, density, gas_pressure)
@@ -164,8 +165,8 @@ def detect_flux_ropes(magnetic_field,
                                                  start.item(),
                                                  end.item(),
                                                  duration,
-                                                 tuple(batch_axes[i].cpu().numpy()),
-                                                 tuple(batch_frames[i].cpu().numpy()),
+                                                 *tuple(batch_axes[i].cpu().numpy()),
+                                                 *tuple(batch_frames[i].cpu().numpy()),
                                                  error_fit.item())
 
             if cuda:
@@ -173,7 +174,11 @@ def detect_flux_ropes(magnetic_field,
 
         _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit)
 
-    return list(sorted(remaining_events, key=lambda x: x[1]))
+    remaining_events = list(sorted(remaining_events, key=lambda x: x[1]))
+    return pd.DataFrame(remaining_events, columns=["error_diff", "start", "end", "duration",
+                                                   "axis_x", "axis_y", "axis_z",
+                                                   "frame_x", "frame_y", "frame_z",
+                                                   "error_fit"])
 
 
 def _find_frames(magnetic_field, velocity, trial_axes, frame_type):
