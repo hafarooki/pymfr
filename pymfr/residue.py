@@ -2,8 +2,6 @@ import torch
 from torchinterp1d import Interp1d
 import numpy as np
 
-interp = Interp1d()
-
 
 def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=None):
     assert len(inflection_points.shape) == 1
@@ -12,8 +10,6 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
 
     if len(inflection_points) == 0:
         return torch.empty((0,), device=inflection_points.device, dtype=torch.float32)
-
-    interp = Interp1d()
 
     # force to be positive at peak
     potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
@@ -57,12 +53,12 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
 
     potential_interp = torch.linspace(0, 1, duration, device=folded_data.device)
     potential_interp = potential_interp.unsqueeze(0).expand(folded_data.shape[0], -1)
-    interpolated1 = interp.forward(x=folded_data[:, 0, :],
-                                   y=folded_data[:, 1, :],
-                                   xnew=potential_interp)
-    interpolated2 = interp.forward(x=folded_data[:, 2, :],
-                                   y=folded_data[:, 3, :],
-                                   xnew=potential_interp)
+    interpolated1 = Interp1d.apply(folded_data[:, 0, :],
+                                   folded_data[:, 1, :],
+                                   potential_interp)
+    interpolated2 = Interp1d.apply(folded_data[:, 2, :],
+                                   folded_data[:, 3, :],
+                                   potential_interp)
     interp_diff = (interpolated1 - interpolated2) ** 2
 
     pressure_clipped = torch.where(unclipped_mask, pressure, pressure.mean(dim=1, keepdim=True))
