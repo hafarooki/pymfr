@@ -69,13 +69,6 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
     # infinity if 0 pressure range
     error_diff = torch.where(pressure_range > 0, error_diff, torch.inf)
 
-    # require at least 1/4 duration on each branch after trimming
-    max_clip = max_clip if max_clip is not None else duration // 2
-    error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)
-                              & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
-                              & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
-                              ), error_diff, torch.inf)
-
     # peak pressure must be on top
     peak_pressure = pressure.gather(1, inflection_points.unsqueeze(1)).squeeze(1)
     average_pressure = pressure.quantile(0.85, dim=1)
