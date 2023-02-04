@@ -19,6 +19,7 @@ def detect_flux_ropes(magnetic_field,
                       window_steps,
                       min_strength,
                       frame_type="vht",
+                      smooth_factor=16,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
@@ -49,6 +50,7 @@ def detect_flux_ropes(magnetic_field,
         Simply takes the average velocity over the window. Fastest but least precise.
     - "vht":
         Finds the frame that minimizes the averaged electric field magnitude squared.
+    :param smooth_factor: The A array is smoothed by duration//smooth_factor moving average before checking for multiple inflection points
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
@@ -127,7 +129,7 @@ def detect_flux_ropes(magnetic_field,
 
             alfvenicity_mask = alfvenicity <= threshold_walen
 
-            inflection_points, inflection_point_counts = _find_inflection_points(potential)
+            inflection_points, inflection_point_counts = _find_inflection_points(potential, smooth_factor)
 
             peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                         inflection_points]
@@ -290,10 +292,10 @@ def _calculate_alfvenicity(frame, windows):
     return torch.abs(walen_slope)
 
 
-def _find_inflection_points(potential):
+def _find_inflection_points(potential, smooth_factor):
     inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
 
-    smoothed = _smooth(potential)
+    smoothed = _smooth(potential, smooth_factor)
 
     points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
 
@@ -301,9 +303,9 @@ def _find_inflection_points(potential):
     return inflection_points, inflection_point_counts
 
 
-def _smooth(potential):
+def _smooth(potential, smooth_factor):
     duration = potential.shape[1]
-    kernel_size = duration // 16 // 2 * 2 + 1  # divide by 16, floor, round up to nearest odd
+    kernel_size = duration // smooth_factor // 2 * 2 + 1  # divide by smooth_factor, floor, round up to nearest odd
     if kernel_size > 1:
         smoothed = F.avg_pool1d(potential,
                                 kernel_size=kernel_size,
