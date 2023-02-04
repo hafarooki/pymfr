@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import tqdm as tqdm
 
 from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
-from pymfr.frame import estimate_ht_frame, estimate_ht2d_frame
+from pymfr.frame import estimate_ht_frame
 
 from pymfr.residue import _calculate_residue_fit
 
@@ -19,11 +19,10 @@ def detect_flux_ropes(magnetic_field,
                       window_steps,
                       min_strength,
                       frame_type="vht",
-                      altitude_range=range(10, 90, 5),
-                      azimuth_range=range(0, 360, 5),
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
+                      n_trial_axes=128,
                       cuda=True):
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
@@ -50,11 +49,6 @@ def detect_flux_ropes(magnetic_field,
         Simply takes the average velocity over the window. Fastest but least precise.
     - "vht":
         Finds the frame that minimizes the averaged electric field magnitude squared.
-    - "vht_2d":
-        Finds a frame with an approximately constant electric field magnitude
-        along the trial axis, which in theory should be present for a 2D structure.
-    :param altitude_range: Range of trial axis altitudes.
-    :param azimuth_range: Range of trial axis azimuths.
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
@@ -69,10 +63,6 @@ def detect_flux_ropes(magnetic_field,
     """
 
     tensor = _pack_data(magnetic_field, velocity, density, gas_pressure)
-
-    trial_axes = _get_trial_axes(altitude_range, azimuth_range)
-    if cuda:
-        trial_axes = trial_axes.cuda()
 
     # these are updated as the algorithm runs
     # contains_existing keeps track of samples that were already confirmed as MFRs
@@ -89,7 +79,7 @@ def detect_flux_ropes(magnetic_field,
         window_starts = torch.arange(len(windows)) * window_step
         overlap_batches = contains_existing.unfold(size=duration, step=window_step, dimension=0)
 
-        window_size_mb = np.product(windows.shape[1:]) * len(trial_axes) * 32 / 1024 / 1024
+        window_size_mb = np.product(windows.shape[1:]) * 32 / 1024 / 1024
 
         assert batch_size_mb >= window_size_mb, f"Batch size ({batch_size_mb} MB) < window size ({window_size_mb} MB)"
         batch_size = int(max(batch_size_mb / window_size_mb // 8 * 8, 1))
@@ -114,7 +104,7 @@ def detect_flux_ropes(magnetic_field,
             if len(batch_data) == 0:
                 continue
 
-            batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], trial_axes, frame_type)
+            batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], n_trial_axes, frame_type)
 
             error_diff = calculate_residue_map(batch_data[:, :, :3], batch_data[:, :, 9], batch_frames, batch_axes,
                                                max_clip=window_step)
@@ -181,23 +171,40 @@ def detect_flux_ropes(magnetic_field,
                                                    "error_fit"])
 
 
-def _find_frames(magnetic_field, velocity, trial_axes, frame_type):
+def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type):
     n_batch = len(magnetic_field)
-    batch_axes = trial_axes.unsqueeze(0).expand(n_batch, -1, -1)
 
-    electric_field = -torch.cross(velocity, magnetic_field, dim=2)
-
-    n_trial_axis = len(trial_axes)
+    # Implements a trick I came up with and presented at NRSM 2023--
+    # essentially, we can determine the y direction analytically
+    # because <\vec{B}> is perp to y since -int_0^1 By dx = A_f - A_0 = 0 and x \propto t
+    # in addition to \vec{v}_{HT} being perp to y
+    # since both are perp and (almost) always nonparallel, we can determine y! isn't it fun?
+    # -H. Farooki
 
     if frame_type == "mean_velocity":
-        batch_frames = velocity.mean(dim=1).unsqueeze(1).expand(-1, n_trial_axis, -1)
-    elif frame_type == "vht_2d":
-        batch_frames = estimate_ht2d_frame(magnetic_field, electric_field, batch_axes)
+        frames = velocity.mean(dim=1)
     elif frame_type == "vht":
-        vht = estimate_ht_frame(magnetic_field, electric_field)
-        batch_frames = vht.unsqueeze(1).expand(-1, n_trial_axis, -1)
+        electric_field = -torch.cross(velocity, magnetic_field, dim=2)
+        frames = estimate_ht_frame(magnetic_field, electric_field)
     else:
         raise Exception(f"Unknown frame type {frame_type}")
+    
+    mean_magnetic_field_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
+
+    # this is the y direction
+    vertical_direction = F.normalize(torch.cross(mean_magnetic_field_directions, -frames, dim=-1), dim=-1)
+
+    # horizontal direction assuming z is along <B>
+    horizontal_direction = F.normalize(torch.cross(vertical_direction, mean_magnetic_field_directions, dim=-1), dim=-1)
+
+    # rotation matrix from flux rope coordinate to data coordinates
+    rotation_matrix = torch.stack([horizontal_direction, vertical_direction, mean_magnetic_field_directions], dim=2)
+    theta = torch.linspace(-np.pi / 2, np.pi / 2, n_trial_axes, device=rotation_matrix.device)
+    in_plane_vectors = torch.stack([torch.sin(theta), torch.zeros_like(theta), torch.cos(theta)], dim=-1)
+    in_plane_vectors = in_plane_vectors.unsqueeze(0).expand(n_batch, -1, -1)
+    batch_axes = (rotation_matrix @ in_plane_vectors.transpose(1, 2)).transpose(1, 2)
+
+    batch_frames = frames.unsqueeze(1).expand(-1, n_trial_axes, -1)
 
     return batch_frames, batch_axes
 
