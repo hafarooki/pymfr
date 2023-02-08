@@ -24,6 +24,7 @@ def detect_flux_ropes(magnetic_field,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
                       n_trial_axes=128,
+                      min_positive_axial_component=0.95,
                       cuda=True):
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
@@ -54,6 +55,7 @@ def detect_flux_ropes(magnetic_field,
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
+    :param require_positive_axial_component: Percentage of Bz to require to be positive. Default 0.95 (i.e. 95%).
     0 would mean it has to be 0, 1 would mean it can be equal to the maximum value.
     This threshold is unique to this implementation--the original paper trims the window instead,
     which is not trivial to do with the efficient vectorized computations of this implementation.
@@ -142,7 +144,9 @@ def detect_flux_ropes(magnetic_field,
                            (peaks > thresholds)
             error_diff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
 
-            mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff)
+            mask_positive_Bz = (rotated_field[:, :, 2] > 0).to(torch.float32).mean(dim=-1) > min_positive_axial_component
+
+            mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff) & mask_positive_Bz
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
