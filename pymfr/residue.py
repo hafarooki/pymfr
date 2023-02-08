@@ -3,10 +3,10 @@ from torchinterp1d import Interp1d
 import numpy as np
 
 
-def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=None):
+def _calculate_residue_diff(inflection_points, potential, field_line_invariant, max_clip=None):
     assert len(inflection_points.shape) == 1
     assert len(potential.shape) == 2
-    assert len(pressure.shape) == 2
+    assert len(field_line_invariant.shape) == 2
 
     if len(inflection_points) == 0:
         return torch.empty((0,), device=inflection_points.device, dtype=torch.float32)
@@ -14,8 +14,8 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
     # force to be positive at peak
     potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
 
-    # second dim is potential1, pressure1, potential2, pressure2
-    folded_data = torch.concat((potential.unsqueeze(1), pressure.unsqueeze(1)), dim=1).repeat(1, 2, 1)
+    # second dim is potential1, field_line_invariant1, potential2, field_line_invariant2
+    folded_data = torch.concat((potential.unsqueeze(1), field_line_invariant.unsqueeze(1)), dim=1).repeat(1, 2, 1)
     duration = folded_data.shape[2]
 
     all_indices = torch.arange(duration, device=inflection_points.device)
@@ -61,33 +61,40 @@ def _calculate_residue_diff(inflection_points, potential, pressure, max_clip=Non
                                    potential_interp)
     interp_diff = (interpolated1 - interpolated2) ** 2
 
-    pressure_clipped = torch.where(unclipped_mask, pressure, pressure.mean(dim=1, keepdim=True))
-    min_pressure, max_pressure = torch.aminmax(pressure_clipped, dim=1)
-    pressure_range = max_pressure - min_pressure
-    error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / pressure_range
+    field_line_invariant_clipped = torch.where(unclipped_mask, field_line_invariant, field_line_invariant.mean(dim=1, keepdim=True))
+    min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant_clipped, dim=1)
+    field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
+    error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / field_line_invariant_range
 
-    # infinity if 0 pressure range
-    error_diff = torch.where(pressure_range > 0, error_diff, torch.inf)
+    # infinity if 0 field_line_invariant range
+    error_diff = torch.where(field_line_invariant_range > 0, error_diff, torch.inf)
 
-    # peak pressure must be on top
-    peak_pressure = pressure.gather(1, inflection_points.unsqueeze(1)).squeeze(1)
-    average_pressure = pressure.quantile(0.85, dim=1)
-    error_diff = torch.where(peak_pressure > average_pressure, error_diff, torch.inf)
+    # peak field_line_invariant must be on top
+    peak_field_line_invariant = field_line_invariant.gather(1, inflection_points.unsqueeze(1)).squeeze(1)
+    average_field_line_invariant = field_line_invariant.quantile(0.85, dim=1)
+    error_diff = torch.where(peak_field_line_invariant > average_field_line_invariant, error_diff, torch.inf)
+
+    # require a minimum amount of each branch after trimming
+    max_clip = max_clip if max_clip is not None else duration // 2
+    error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)
+                              & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
+                              & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
+                              ), error_diff, torch.inf)
 
     return error_diff
 
 
 def _calculate_residue_fit(potential_array,
-                           transverse_pressure):
-    min_pressure, max_pressure = torch.aminmax(transverse_pressure)
-    pressure_range = max_pressure - min_pressure
+                           transverse_field_line_invariant):
+    min_field_line_invariant, max_field_line_invariant = torch.aminmax(transverse_field_line_invariant)
+    field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
 
     potential_array = potential_array.cpu().numpy()
-    transverse_pressure = transverse_pressure.cpu().numpy()
+    transverse_field_line_invariant = transverse_field_line_invariant.cpu().numpy()
 
-    coeffs = np.polyfit(x=potential_array, y=transverse_pressure, deg=3)
-    pressure_fit = np.poly1d(coeffs)(potential_array)
-    rmse = np.sqrt(np.mean((transverse_pressure - pressure_fit) ** 2))
-    error_fit = rmse / pressure_range
+    coeffs = np.polyfit(x=potential_array, y=transverse_field_line_invariant, deg=3)
+    field_line_invariant_fit = np.poly1d(coeffs)(potential_array)
+    rmse = np.sqrt(np.mean((transverse_field_line_invariant - field_line_invariant_fit) ** 2))
+    error_fit = rmse / field_line_invariant_range
 
     return error_fit

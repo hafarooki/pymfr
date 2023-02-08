@@ -7,7 +7,7 @@ import tqdm as tqdm
 from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
 from pymfr.frame import estimate_ht_frame
 
-from pymfr.residue import _calculate_residue_fit
+from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit
 
 
 def detect_flux_ropes(magnetic_field,
@@ -108,10 +108,14 @@ def detect_flux_ropes(magnetic_field,
 
             batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], n_trial_axes, frame_type)
 
-            error_diff = calculate_residue_map(batch_data[:, :, :3], batch_data[:, :, 9], batch_frames, batch_axes,
+            # For determining the axis we only use magnetic field data, not gas pressure
+            # This is because gas pressure error diff is not affected by rotations about the y axis
+            # unlike Bz, which depends on the axis orientation
+            # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
+            error_diff_axis = calculate_residue_map(batch_data[:, :, :3], batch_frames, batch_axes,
                                                max_clip=window_step)
 
-            error_diff, argmin = error_diff.min(dim=-1)
+            error_diff_axis, argmin = error_diff_axis.min(dim=-1)
             index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
             batch_axes = batch_axes.gather(-2, index).squeeze(-2)
             batch_frames = batch_frames.gather(-2, index).squeeze(-2)
@@ -136,6 +140,7 @@ def detect_flux_ropes(magnetic_field,
             thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
             folding_mask = (inflection_point_counts == 1) & \
                            (peaks > thresholds)
+            error_diff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
 
             mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff)
 

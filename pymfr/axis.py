@@ -6,19 +6,19 @@ import torch.nn.functional as F
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=None):
+def minimize_rdiff(magnetic_field, frame_velocity, trial_axes, max_clip=None):
     """
     WIP API for finding best axis using Rdiff as a criteria
     """
 
-    rdiff = calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=max_clip)
+    rdiff = calculate_residue_map(magnetic_field, frame_velocity, trial_axes, max_clip=max_clip)
     rdiff, argmin = rdiff.min(dim=-1)
     index = argmin.unsqueeze(-1).unsqueeze(-1).expand(*[-1] * len(magnetic_field.shape[:-2]), -1, 3)
     trial_axes = trial_axes.gather(-2, index).squeeze(-2)
     return trial_axes, rdiff
 
 
-def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_axes, max_clip=None):
+def calculate_residue_map(magnetic_field, frame_velocity, trial_axes, max_clip=None):
     """
     WIP API
     """
@@ -26,9 +26,8 @@ def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_ax
     batch_size = magnetic_field.shape[:-2]
     duration = magnetic_field.shape[-2]
     n_trial_axes = trial_axes.shape[-2]
-    assert magnetic_field.device == gas_pressure.device == frame_velocity.device == trial_axes.device
+    assert magnetic_field.device == frame_velocity.device == trial_axes.device
     assert magnetic_field.shape == (*batch_size, duration, 3)
-    assert gas_pressure.shape == (*batch_size, duration)
     assert frame_velocity.shape == (*batch_size, 3) or frame_velocity.shape == (*batch_size, n_trial_axes, 3)
     assert trial_axes.shape == (*batch_size, n_trial_axes, 3)
     device = magnetic_field.device
@@ -37,17 +36,17 @@ def calculate_residue_map(magnetic_field, gas_pressure, frame_velocity, trial_ax
         trial_frame = frame_velocity.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
     else:
         trial_frame = frame_velocity
-    trial_gas_pressure = gas_pressure.unsqueeze(len(batch_size)).expand(*([-1] * len(batch_size)), n_trial_axes, -1)
+    
     rotated_field = _rotate_field(trial_axes.reshape(-1, 3),
                                   trial_field.reshape(-1, duration, 3),
                                   trial_frame.reshape(-1, 3)).reshape(*batch_size, n_trial_axes, duration, 3)
-    transverse_pressure = trial_gas_pressure + (rotated_field[..., 2] * 1e-9) ** 2 / (2 * scipy.constants.mu_0) * 1e9
     potential = torch.zeros(rotated_field.shape[:-1], device=device)
     potential[..., 1:] = torch.cumulative_trapezoid(rotated_field[..., 1])
+    field_line_invariant = rotated_field[..., 2]
     inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
     rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
                                     potential.reshape(-1, duration),
-                                    transverse_pressure.reshape(-1, duration),
+                                    field_line_invariant.reshape(-1, duration),
                                     max_clip).reshape(*batch_size, n_trial_axes)
     return rdiff
 
