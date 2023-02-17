@@ -325,8 +325,4 @@ def _smooth(potential, smooth_factor):
     else:
         smoothed = potential
     return smoothed
-
-
-def _calculate_trim_mask(potential, threshold_folding):
-    trim_mask = (potential[:, -1].abs() / potential.abs().amax(dim=1)) < threshold_folding
-    return trim_mask
+\
