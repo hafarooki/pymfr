@@ -71,80 +71,85 @@ def detect_flux_ropes(magnetic_field,
     # contains_existing keeps track of samples that were already confirmed as MFRs
     # for longer durations so that shorter durations do not attempt to overwrite them
     contains_existing = torch.zeros(len(magnetic_field), dtype=torch.bool)
-    remaining_events = []
+    remaining_events = list()
 
     sliding_windows = _get_sliding_windows(window_lengths, window_steps)
 
     for duration, window_step in tqdm.tqdm(sliding_windows):
-        event_candidates = {}
+        # dictionary: index of inflection point -> flux rope candidate
+        event_candidates = dict()
 
+        # generate the sliding windows, and transpose to make it so the dimensions are (batch, time, physical quantity)
         windows = tensor.unfold(size=duration, step=window_step, dimension=0).transpose(1, 2)
         window_starts = torch.arange(len(windows)) * window_step
         overlap_batches = contains_existing.unfold(size=duration, step=window_step, dimension=0)
+
+        # do not process windows that have missing data, do not fit the min field strength, or overlap with an existing flux rope candidate of longer duration
+        # we these windows from the start to improve performance
+        mask = ~torch.any(torch.any(torch.isnan(windows), dim=2), dim=1) & \
+                (torch.norm(windows[:, :, :3], dim=2).mean(dim=1) >= min_strength) & \
+                ~torch.any(overlap_batches, dim=1)
+
+        windows = windows[mask]
+        window_starts = window_starts[mask]
+
+        # skip if no windows remain after applying the mask
+        if len(windows) == 0:
+            continue
 
         window_size_mb = np.product(windows.shape[1:]) * 32 / 1024 / 1024
 
         assert batch_size_mb >= window_size_mb, f"Batch size ({batch_size_mb} MB) < window size ({window_size_mb} MB)"
         batch_size = int(max(batch_size_mb / window_size_mb // 8 * 8, 1))
 
+        # iterate the windows of the same duration in batches to avoid running out of memory
         for i_batch in reversed(range(0, len(windows), batch_size)):
             batch_data = windows[i_batch:i_batch + batch_size]
             batch_starts = window_starts[i_batch:i_batch + batch_size]
-            batch_overlaps = overlap_batches[i_batch:i_batch + batch_size]
 
             if cuda:
                 batch_data = batch_data.cuda()
                 batch_starts = batch_starts.cuda()
-                batch_overlaps = batch_overlaps.cuda()
+            
+            # extract individual physical quantities
+            batch_magnetic_field = batch_data[:, :, :3]
+            batch_velocity = batch_data[:, :, 3:6]
+            batch_gas_pressure = batch_data[:, :, 9]
 
-            mask = ~torch.any(torch.any(torch.isnan(batch_data), dim=2), dim=1) & \
-                   (torch.norm(batch_data[:, :, :3], dim=2).mean(dim=1) >= min_strength) & \
-                   ~torch.any(batch_overlaps, dim=1)
+            # first find the velocity frames and the minimum difference residue axes
+            batch_frames, batch_axes = _find_frames(batch_magnetic_field, batch_velocity, n_trial_axes, frame_type, max_clip=window_step)
 
-            batch_data = batch_data[mask]
-            batch_starts = batch_starts[mask]
-
-            if len(batch_data) == 0:
-                continue
-
-            batch_frames, batch_axes = _find_frames(batch_data[:, :, :3], batch_data[:, :, 3:6], n_trial_axes, frame_type)
-
-            # For determining the axis we only use magnetic field data, not gas pressure
-            # This is because gas pressure error diff is not affected by rotations about the y axis
-            # unlike Bz, which depends on the axis orientation
-            # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
-            error_diff_axis = calculate_residue_map(batch_data[:, :, :3], batch_frames, batch_axes,
-                                               max_clip=window_step)
-
-            error_diff_axis, argmin = error_diff_axis.min(dim=-1)
-            index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
-            batch_axes = batch_axes.gather(-2, index).squeeze(-2)
-            batch_frames = batch_frames.gather(-2, index).squeeze(-2)
-
+            # estimate alfvenicity using walen slope
             alfvenicity = _calculate_alfvenicity(batch_frames, batch_data)
+            alfvenicity_mask = alfvenicity <= threshold_walen
 
-            rotated_field = _rotate_field(batch_axes, batch_data[:, :, :3], batch_frames)
-
+            # rotate the magnetic field data into the flux rope coordinate system
+            rotated_field = _rotate_field(batch_axes, batch_magnetic_field, batch_frames)
+            
+            # calculate the A array/magnetic flux function/potential using $A(x) = -\int_{x_0}^x B_y dx$
             potential = torch.zeros((len(rotated_field)), rotated_field.shape[1], device=rotated_field.device)
             potential[:, 1:] = torch.cumulative_trapezoid(rotated_field[:, :, 1])
 
-            batch_gas_pressure = batch_data[:, :, 9]
+            # use the potential peaks as the inflection points
+            inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
+            
+            # calculate $p_t = B_z^2/2mu_0 + p$
             transverse_magnetic_pressure = (rotated_field[:, :, 2] * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
             transverse_pressure = batch_gas_pressure + transverse_magnetic_pressure
-
-            alfvenicity_mask = alfvenicity <= threshold_walen
-
-            inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
-
+            
+            # require the inflection point pressure to be within the top 85%
             peak_pressure = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                         inflection_points]
-            thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
-            folding_mask = peak_pressure > thresholds
+            pressure_peak_mask = peak_pressure > torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
+            
+            # calculate difference residue
             error_diff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
 
+            # require a certain percentage of Bz to be positive
             mask_positive_Bz = (rotated_field[:, :, 2] > 0).to(torch.float32).mean(dim=-1) > min_positive_axial_component
 
-            mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff) & mask_positive_Bz
+            # combine all the masks
+            mask = alfvenicity_mask & pressure_peak_mask & (error_diff <= threshold_diff) & mask_positive_Bz
 
             for i in torch.nonzero(mask).flatten():
                 if _count_inflection_points(potential[i]) > 1:
@@ -174,6 +179,7 @@ def detect_flux_ropes(magnetic_field,
             if cuda:
                 torch.cuda.empty_cache()
 
+        # done at the end of processing all batches with a given duration
         _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit)
 
     remaining_events = list(sorted(remaining_events, key=lambda x: x[1]))
@@ -183,7 +189,7 @@ def detect_flux_ropes(magnetic_field,
                                                    "error_fit"])
 
 
-def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type):
+def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type, max_clip):
     n_batch = len(magnetic_field)
 
     # Implements a trick I came up with and presented at NRSM 2023--
@@ -214,11 +220,21 @@ def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type):
     theta = torch.linspace(-np.pi / 2, np.pi / 2, n_trial_axes, device=rotation_matrix.device)
     in_plane_vectors = torch.stack([torch.sin(theta), torch.zeros_like(theta), torch.cos(theta)], dim=-1)
     in_plane_vectors = in_plane_vectors.unsqueeze(0).expand(n_batch, -1, -1)
-    batch_axes = (rotation_matrix @ in_plane_vectors.transpose(1, 2)).transpose(1, 2)
+    axes = (rotation_matrix @ in_plane_vectors.transpose(1, 2)).transpose(1, 2)
 
-    batch_frames = frames.unsqueeze(1).expand(-1, n_trial_axes, -1)
+    # For determining the axis we only use magnetic field data, not gas pressure
+    # This is because gas pressure error diff is not affected by rotations about the y axis
+    # unlike Bz, which depends on the axis orientation
+    # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
+    error_diff_axis = calculate_residue_map(magnetic_field, frames, axes,
+                                        max_clip=max_clip)
 
-    return batch_frames, batch_axes
+    # select the best orientation
+    error_diff_axis, argmin = error_diff_axis.min(dim=-1)
+    index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
+    axes = axes.gather(-2, index).squeeze(-2)
+
+    return frames, axes
 
 
 def _pack_data(magnetic_field, velocity, density, gas_pressure):
