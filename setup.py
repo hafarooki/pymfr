@@ -14,6 +14,7 @@ setup(
     keywords="pymfr fluxrope mfr smfr grad-shafranov gs",
     install_requires=["torch>=1.8.2",
                       "numpy",
+                      "scipy",
                       "tqdm",
                       "torchinterp1d @ git+https://github.com/aliutkus/torchinterp1d.git"]
 )

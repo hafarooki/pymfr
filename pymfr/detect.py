@@ -3,8 +3,9 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
+from scipy.signal import savgol_filter
 
-from pymfr.axis import _get_trial_axes, _rotate_field, calculate_residue_map
+from pymfr.axis import _rotate_field, calculate_residue_map
 from pymfr.frame import estimate_ht_frame
 
 from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit
@@ -19,7 +20,6 @@ def detect_flux_ropes(magnetic_field,
                       window_steps,
                       min_strength,
                       frame_type="vht",
-                      smooth_factor=16,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
@@ -51,7 +51,6 @@ def detect_flux_ropes(magnetic_field,
         Simply takes the average velocity over the window. Fastest but least precise.
     - "vht":
         Finds the frame that minimizes the averaged electric field magnitude squared.
-    :param smooth_factor: The A array is smoothed by duration//smooth_factor moving average before checking for multiple inflection points
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
@@ -135,13 +134,12 @@ def detect_flux_ropes(magnetic_field,
 
             alfvenicity_mask = alfvenicity <= threshold_walen
 
-            inflection_points, inflection_point_counts = _find_inflection_points(potential, smooth_factor)
+            inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
 
-            peaks = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
+            peak_pressure = transverse_pressure[torch.arange(len(transverse_pressure), device=transverse_pressure.device),
                                         inflection_points]
             thresholds = torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
-            folding_mask = (inflection_point_counts == 1) & \
-                           (peaks > thresholds)
+            folding_mask = peak_pressure > thresholds
             error_diff = _calculate_residue_diff(inflection_points, potential, transverse_pressure)
 
             mask_positive_Bz = (rotated_field[:, :, 2] > 0).to(torch.float32).mean(dim=-1) > min_positive_axial_component
@@ -149,6 +147,9 @@ def detect_flux_ropes(magnetic_field,
             mask = alfvenicity_mask & folding_mask & (error_diff <= threshold_diff) & mask_positive_Bz
 
             for i in torch.nonzero(mask).flatten():
+                if _count_inflection_points(potential[i]) > 1:
+                    continue
+
                 inflection_point = inflection_points[i]
                 start = batch_starts[i]
                 event_index = start + inflection_point.item()
@@ -256,11 +257,6 @@ def _get_sliding_windows(window_lengths, window_steps):
     return list(reversed(sorted(zip(window_lengths, window_steps), key=lambda x: x[0])))
 
 
-def _resize(batch_data, batch_starts, trial_axes):
-    batch_data = batch_data.repeat(len(trial_axes), 1, 1)
-    batch_starts = batch_starts.repeat(len(trial_axes))
-    return batch_data, batch_starts
-
 
 def _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit):
     # sort by end time
@@ -301,28 +297,14 @@ def _calculate_alfvenicity(frame, windows):
     return torch.abs(walen_slope)
 
 
-def _find_inflection_points(potential, smooth_factor):
-    inflection_points = potential[..., 1:-1].abs().argmax(dim=1) + 1
+def _count_inflection_points(potential):
+    window_size = len(potential) // 2
+    if window_size % 2 == 0:
+        window_size += 1
+    smoothed = savgol_filter(potential.cpu().numpy(), window_length=window_size, polyorder=3)
 
-    smoothed = _smooth(potential, smooth_factor)
+    is_sign_change = (np.diff(np.sign(np.diff(smoothed))) != 0).astype(int)
+    is_sign_change[0] = 0
+    is_sign_change[-1] = 0
 
-    points = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).int()
-
-    inflection_point_counts = points.sum(dim=1).long()
-    return inflection_points, inflection_point_counts
-
-
-def _smooth(potential, smooth_factor):
-    duration = potential.shape[1]
-    kernel_size = duration // smooth_factor // 2 * 2 + 1  # divide by smooth_factor, floor, round up to nearest odd
-    if kernel_size > 1:
-        smoothed = F.avg_pool1d(potential,
-                                kernel_size=kernel_size,
-                                stride=1,
-                                padding=(kernel_size - 1) // 2,
-                                count_include_pad=False)
-        assert smoothed.shape[1] == duration
-    else:
-        smoothed = potential
-    return smoothed
-\
+    return int(np.sum(is_sign_change))
