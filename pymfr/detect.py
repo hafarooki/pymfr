@@ -55,12 +55,6 @@ def detect_flux_ropes(magnetic_field,
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
     :param require_positive_axial_component: Percentage of Bz to require to be positive. Default 0.95 (i.e. 95%).
-    0 would mean it has to be 0, 1 would mean it can be equal to the maximum value.
-    This threshold is unique to this implementation--the original paper trims the window instead,
-    which is not trivial to do with the efficient vectorized computations of this implementation.
-    The threshold should be close enough to 0 so that we satisfy the assumption that
-    we crossed the flux boundary twice, high enough to account for uncertainties in the measurements
-    and calculations. By default, it is 0.5.
     :param cuda: Whether to use the GPU
     :return: A DataFrame describing the detected flux ropes.
     """
