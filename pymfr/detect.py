@@ -184,13 +184,12 @@ def detect_flux_ropes(magnetic_field,
 
 
 def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type, max_clip):
-    n_batch = len(magnetic_field)
-
-    # Implements a trick I came up with and presented at NRSM 2023--
+    # Implements a trick I came up with to narrow down the orientation possibilities--
     # essentially, we can determine the y direction analytically
     # because <\vec{B}> is perp to y since -int_0^1 By dx = A_f - A_0 = 0 and x \propto t
     # in addition to \vec{v}_{HT} being perp to y
-    # since both are perp and (almost) always nonparallel, we can determine y! isn't it fun?
+    # since both are perp and (almost) always nonparallel, we can determine y
+    # however, in some cases they are nearly parallel, which I will handle by performing trial and error on y
     # -H. Farooki
 
     if frame_type == "mean_velocity":
@@ -200,21 +199,29 @@ def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type, max_clip):
         frames = estimate_ht_frame(magnetic_field, electric_field)
     else:
         raise Exception(f"Unknown frame type {frame_type}")
+
+    vertical_directions = determine_vertical_directions(magnetic_field, frames, n_trial_axes, max_clip)
+
+    # generate trial axes by rotating <B> around the vertical axis (we expect z to be <B> +- 90 degrees around y, since <Bz> should be positive)
     
+    axes, _ = minimize_axis_residue(magnetic_field, vertical_directions, frames, n_trial_axes, max_clip)
+
+    return frames, axes
+
+
+def minimize_axis_residue(magnetic_field, vertical_directions, frames, n_trial_axes, max_clip):
     mean_magnetic_field_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
 
-    # this is the y direction
-    vertical_direction = F.normalize(torch.cross(mean_magnetic_field_directions, -frames, dim=-1), dim=-1)
-
-    # horizontal direction assuming z is along <B>
-    horizontal_direction = F.normalize(torch.cross(vertical_direction, mean_magnetic_field_directions, dim=-1), dim=-1)
+    # horizontal direction for temporary coordinate system (we want vertical direction up and one of the axes to be <B>)
+    horizontal_directions = F.normalize(torch.cross(vertical_directions, mean_magnetic_field_directions, dim=-1), dim=-1)
 
     # rotation matrix from flux rope coordinate to data coordinates
-    rotation_matrix = torch.stack([horizontal_direction, vertical_direction, mean_magnetic_field_directions], dim=2)
-    theta = torch.linspace(-np.pi / 2, np.pi / 2, n_trial_axes, device=rotation_matrix.device)
-    in_plane_vectors = torch.stack([torch.sin(theta), torch.zeros_like(theta), torch.cos(theta)], dim=-1)
-    in_plane_vectors = in_plane_vectors.unsqueeze(0).expand(n_batch, -1, -1)
-    axes = (rotation_matrix @ in_plane_vectors.transpose(1, 2)).transpose(1, 2)
+    rotation_matrix = torch.stack([horizontal_directions, vertical_directions, mean_magnetic_field_directions], dim=-1)
+
+    phi = torch.linspace(-np.pi / 2, np.pi / 2, n_trial_axes, device=rotation_matrix.device)
+    in_plane_vectors = torch.stack([torch.sin(phi), torch.zeros_like(phi), torch.cos(phi)], dim=-1)
+    in_plane_vectors = in_plane_vectors.view((*[1] * (len(vertical_directions.shape) - 1), *in_plane_vectors.shape)).expand((*vertical_directions.shape[:-1], *in_plane_vectors.shape))
+    axes = (rotation_matrix @ in_plane_vectors.transpose(-1, -2)).transpose(-1, -2)
 
     # For determining the axis we only use magnetic field data, not gas pressure
     # This is because gas pressure error diff is not affected by rotations about the y axis
@@ -224,11 +231,48 @@ def _find_frames(magnetic_field, velocity, n_trial_axes, frame_type, max_clip):
                                         max_clip=max_clip)
 
     # select the best orientation
-    error_diff_axis, argmin = error_diff_axis.min(dim=-1)
-    index = argmin.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3)
+    error_diff_axis_min, argmin = error_diff_axis.min(dim=-1)
+    index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
     axes = axes.gather(-2, index).squeeze(-2)
+    return axes, error_diff_axis_min
 
-    return frames, axes
+
+def determine_vertical_directions(magnetic_field, frames, n_trial_axes, max_clip):
+    # direction of spacecraft motion through flux rope axis and cross section
+    path_direction = F.normalize(-frames)
+    mean_magnetic_field_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
+
+    cross_product = torch.cross(mean_magnetic_field_directions, path_direction, dim=-1)
+
+    too_close = torch.norm(cross_product, dim=-1) < np.sin(np.deg2rad(5))
+    
+    vertical_direction = F.normalize(cross_product, dim=-1)
+
+    if not torch.all(~too_close):
+        # use pca to determine a guess y axis (useful if the non-y axis with average zero is a constant zero with maybe small noise)
+        too_close_field = magnetic_field[too_close]
+        too_close_frames = frames[too_close]
+        too_close_directions = path_direction[too_close]
+        perpendicular_field = too_close_field - (too_close_directions.unsqueeze(-2) * too_close_field).sum(dim=-1, keepdims=True) * too_close_directions.unsqueeze(-2)
+        principal_directions = torch.pca_lowrank(perpendicular_field.transpose(-1, -2), 1, center=False)[0].squeeze(-1)
+        assert torch.all(torch.abs((principal_directions * too_close_directions).sum(dim=-1)) < .001), "principal direction not perpendicular to velocity??"
+
+        alternative_directions = F.normalize(torch.cross(principal_directions, too_close_directions))
+        
+        # use for loop to avoid running out of memory with a large batch size
+        theta = torch.linspace(0, np.pi / 2, n_trial_axes // 2, device=principal_directions.device).reshape(1, n_trial_axes // 2, 1)
+        possible_vertical_directions = principal_directions.unsqueeze(1) * torch.cos(theta) + alternative_directions.unsqueeze(1) * torch.sin(theta)
+        
+        min_residue = torch.stack([minimize_axis_residue(too_close_field,
+                                                    possible_vertical_directions[:, i, :],
+                                                    too_close_frames,
+                                                    n_trial_axes,
+                                                    max_clip)[1] for i in range(n_trial_axes // 2)], dim=-1)
+        _, argmin = min_residue.min(dim=-1)
+        index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
+        vertical_direction[too_close] = possible_vertical_directions.gather(-2, index).squeeze(-2)
+
+    return vertical_direction
 
 
 def _pack_data(magnetic_field, velocity, density, gas_pressure):
