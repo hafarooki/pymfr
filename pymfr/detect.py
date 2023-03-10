@@ -260,14 +260,14 @@ def determine_vertical_directions(magnetic_field, frames, n_trial_axes, max_clip
         alternative_directions = F.normalize(torch.cross(principal_directions, too_close_directions))
         
         # use for loop to avoid running out of memory with a large batch size
-        theta = torch.linspace(0, np.pi / 2, n_trial_axes // 2, device=principal_directions.device).reshape(1, n_trial_axes // 2, 1)
+        theta = torch.linspace(-np.pi / 2, np.pi / 2, n_trial_axes, device=principal_directions.device).reshape(1, n_trial_axes, 1)
         possible_vertical_directions = principal_directions.unsqueeze(1) * torch.cos(theta) + alternative_directions.unsqueeze(1) * torch.sin(theta)
         
         min_residue = torch.stack([minimize_axis_residue(too_close_field,
                                                     possible_vertical_directions[:, i, :],
                                                     too_close_frames,
                                                     n_trial_axes,
-                                                    max_clip)[1] for i in range(n_trial_axes // 2)], dim=-1)
+                                                    max_clip)[1] for i in range(n_trial_axes)], dim=-1)
         _, argmin = min_residue.min(dim=-1)
         index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
         vertical_direction[too_close] = possible_vertical_directions.gather(-2, index).squeeze(-2)
