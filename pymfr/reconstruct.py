@@ -32,7 +32,7 @@ def reconstruct_cross_section(magnetic_field_observed, gas_pressure_observed, cr
     magnetic_potential_observed = scipy.integrate.cumulative_trapezoid(-magnetic_field_observed[:, 1], dx=dx, initial=0)
     first_derivative_y_observed = magnetic_field_observed[:, 0]    # Bx
     # mu_0 nPa/nT^2 = 1256.637062
-    field_line_quantity_observed = (scipy.constants.mu_0 * gas_pressure_observed * 1256.637062 + magnetic_field_observed[:, 2] ** 2 / 2)
+    field_line_quantity_observed = (scipy.constants.mu_0 * gas_pressure_observed * 7.958e-4 + magnetic_field_observed[:, 2] ** 2 / 2)
     
     potential_peak = magnetic_potential_observed[np.abs(magnetic_potential_observed).argmax()]
     peak_sign = np.sign(potential_peak)
@@ -41,7 +41,17 @@ def reconstruct_cross_section(magnetic_field_observed, gas_pressure_observed, cr
     assert np.sign(field_line_quantity_fit.deriv()(0)) == peak_sign, "tail is not decreasing"
 
     def laplacian(potential):
-        return -_evaluate_fit_values(field_line_quantity_fit.deriv(), potential, peak_sign)
+        tail_coefficient_left = field_line_quantity_fit(0)
+        tail_exponent_left = field_line_quantity_fit.deriv()(0) / tail_coefficient_left
+        
+        pressure_gradient = field_line_quantity_fit.deriv()(potential)
+        
+        pressure_gradient = np.where(potential * peak_sign >= 0,
+                                     pressure_gradient,
+                                     tail_coefficient_left * tail_exponent_left * np.exp(tail_exponent_left * potential))
+
+        return -pressure_gradient
+
 
     d2_dx2 = _second_derivative
     second_derivative_x = d2_dx2(magnetic_potential_observed)
@@ -97,7 +107,7 @@ def reconstruct_cross_section(magnetic_field_observed, gas_pressure_observed, cr
         else:
           cross_section[:extrapolation_length] = extension[::-1]
 
-    magnetic_potential = cross_section * cross_section_sample_spacing
+    magnetic_potential = cross_section * cross_section_sample_spacing * 1e-9
     magnetic_field_x = np.gradient(cross_section, axis=0)
     magnetic_field_y = -np.gradient(cross_section, axis=1)
     magnetic_field_z_fit = np.poly1d(np.polyfit(magnetic_potential_observed, magnetic_field_observed[:, 2], poly_order))
@@ -116,11 +126,11 @@ def reconstruct_cross_section(magnetic_field_observed, gas_pressure_observed, cr
 
 def _evaluate_fit_values(polynomial_fit, potential, peak_sign):
     tail_coefficient_left = polynomial_fit(0)
-    tail_exponent_left = polynomial_fit(0) / tail_coefficient_left 
+    tail_exponent_left = polynomial_fit.deriv()(0) / tail_coefficient_left 
 
     return np.where(potential * peak_sign >= 0,
                                     polynomial_fit(potential),
-                                    tail_coefficient_left * tail_exponent_left * np.exp(tail_exponent_left * potential))
+                                    tail_coefficient_left * np.exp(tail_exponent_left * potential))
 
 
 def _three_point_smooth(solution, height):
