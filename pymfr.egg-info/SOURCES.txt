@@ -4,6 +4,7 @@ setup.py
 pymfr/axis.py
 pymfr/detect.py
 pymfr/frame.py
+pymfr/reconstruct.py
 pymfr/residue.py
 pymfr.egg-info/PKG-INFO
 pymfr.egg-info/SOURCES.txt

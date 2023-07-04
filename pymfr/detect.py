@@ -16,7 +16,7 @@ def detect_flux_ropes(magnetic_field,
                       velocity,
                       density,
                       gas_pressure,
-                      batch_size_mb,
+                      batch_size,
                       window_lengths,
                       window_steps,
                       min_strength,
@@ -42,10 +42,7 @@ def detect_flux_ropes(magnetic_field,
     :param magnetic_field: Magnetic field vectors in nT, shape (N, 3).
     :param velocity: Proton velocity vectors in km/s, shape (N, 3).
     :param density: Proton number density in cm^-3, shape (N,).
-    :param batch_size_mb: Maximum batch size in megabytes.
-    This is to set an approximate limit to the GPU memory usage. In reality the memory usage
-    should exceed this amount, so it should be set as high as it can be without the GPU running out
-    of memory for optimal performance.
+    :param batch_size_: Number of windows to process per batch.
     :param window_lengths: A range of sliding window sizes.
     :param window_steps: A range of sliding window strides.
     :param min_strength: Minimum <B> for sliding window candidates in nT.
@@ -107,11 +104,6 @@ def detect_flux_ropes(magnetic_field,
         # skip if no windows remain after applying the mask
         if len(windows) == 0:
             continue
-
-        window_size_mb = np.product(windows.shape[1:]) * 32 / 1024 / 1024
-
-        assert batch_size_mb >= window_size_mb, f"Batch size ({batch_size_mb} MB) < window size ({window_size_mb} MB)"
-        batch_size = int(max(batch_size_mb / window_size_mb, 1))
 
         # iterate the windows of the same duration in batches to avoid running out of memory
         for i_batch in reversed(range(0, len(windows), batch_size)):
@@ -233,7 +225,7 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_i
     if axis_optimizer is not None:
         axes = axis_optimizer(magnetic_field, frames, vertical_directions)
         if return_residue:
-            residue = calculate_residue_map(magnetic_field, frames, axes, max_clip=max_clip)
+            residue = calculate_residue_map(magnetic_field, frames, axes.unsqueeze(1), max_clip=max_clip).squeeze(-1)
     else:
         axes = F.normalize(magnetic_field.mean(dim=1), dim=-1)
         
