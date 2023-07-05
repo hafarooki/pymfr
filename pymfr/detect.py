@@ -105,26 +105,28 @@ def detect_flux_ropes(magnetic_field,
                 return self
         
             def __next__(self):
-                if self.i is None:
-                    self.i = self.start
-                else:
-                    self.i += 1
+                while self.i is None or self.i < self.end:
+                    if self.i is None:
+                        self.i = self.start
+                    else:
+                        self.i += 1
 
-                if self.i >= self.end:
-                    raise StopIteration
+                    if self.i >= self.end:
+                        raise StopIteration
 
-                # transpose to make it so the dimensions are (batch, time, physical quantity)
-                window_data = windows[self.i].T
-                if torch.norm(window_data[:, :3], dim=-1).mean() < min_strength:
-                    return self.__next__()
-            
-                if torch.any(overlap_batches[self.i]):
-                    return self.__next__()
 
-                if torch.any(torch.isnan(window_data)):
-                    return self.__next__()
+                    # transpose to make it so the dimensions are (batch, time, physical quantity)
+                    window_data = windows[self.i].T
+                    if torch.norm(window_data[:, :3], dim=-1).mean() < min_strength:
+                        continue
+                
+                    if torch.any(overlap_batches[self.i]):
+                        continue
 
-                return window_starts[self.i], window_data
+                    if torch.any(torch.isnan(window_data)):
+                        continue
+
+                    return window_starts[self.i], window_data
 
         dataloader = DataLoader(WindowDataset(), batch_size, pin_memory=cuda)
 
