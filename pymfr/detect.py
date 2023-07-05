@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 import math
 
 from scipy.signal import savgol_filter
@@ -95,46 +95,24 @@ def detect_flux_ropes(magnetic_field,
         window_starts = torch.arange(len(windows)) * window_step
         overlap_batches = contains_existing.unfold(size=duration, step=window_step, dimension=0)
 
-        class WindowDataset(IterableDataset):
-            def __init__(self):
-                self.start = 0
-                self.end = windows.shape[0]
-
-            def __iter__(self):
-                self.i = None
-                return self
-        
-            def __next__(self):
-                while self.i is None or self.i < self.end:
-                    if self.i is None:
-                        self.i = self.start
-                    else:
-                        self.i += 1
-
-                    if self.i >= self.end:
-                        raise StopIteration
-
-
-                    # transpose to make it so the dimensions are (batch, time, physical quantity)
-                    window_data = windows[self.i].T
-                    if torch.norm(window_data[:, :3], dim=-1).mean() < min_strength:
-                        continue
-                
-                    if torch.any(overlap_batches[self.i]):
-                        continue
-
-                    if torch.any(torch.isnan(window_data)):
-                        continue
-
-                    return window_starts[self.i], window_data
-
-        dataloader = DataLoader(WindowDataset(), batch_size, pin_memory=cuda)
-
         # iterate the windows of the same duration in batches to avoid running out of memory
-        for batch_starts, batch_data in dataloader:
+        for i_batch in range(0, len(windows), batch_size):
+            batch_starts = window_starts[i_batch:i_batch + batch_size]
+            batch_data = windows[i_batch:i_batch + batch_size].transpose(1, 2)
+
+            initial_mask = ~torch.any(torch.any(torch.isnan(batch_data), dim=2), dim=1) & \
+                    (torch.norm(batch_data[:, :, :3], dim=2).mean(dim=1) >= min_strength) & \
+                    ~torch.any(overlap_batches[i_batch:i_batch + batch_size], dim=1)
+            
+            batch_starts = batch_starts[initial_mask]
+            batch_data = batch_data[initial_mask]
+
+            if len(batch_data) == 0:
+                continue
+        
             if cuda:
-                batch_data = batch_data.cuda(non_blocking=True)
-                batch_starts = batch_starts.cuda(non_blocking=True)
+                batch_data = batch_data.cuda()
+                batch_starts = batch_starts.cuda()
             
             # extract individual physical quantities
             batch_magnetic_field = batch_data[:, :, :3]
