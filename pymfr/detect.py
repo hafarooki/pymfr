@@ -1,9 +1,11 @@
+from typing import Iterator
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
+import math
 
 from scipy.signal import savgol_filter
 
@@ -87,31 +89,43 @@ def detect_flux_ropes(magnetic_field,
     for duration, window_step in tqdm.tqdm(sliding_windows):
         # dictionary: index of inflection point -> flux rope candidate
         event_candidates = dict()
-
-        # generate the sliding windows, and transpose to make it so the dimensions are (batch, time, physical quantity)
-        windows = tensor.unfold(size=duration, step=window_step, dimension=0).transpose(1, 2)
+        
+        # generate the sliding windows
+        windows = tensor.unfold(size=duration, step=window_step, dimension=0)
         window_starts = torch.arange(len(windows)) * window_step
         overlap_batches = contains_existing.unfold(size=duration, step=window_step, dimension=0)
 
-        # do not process windows that have missing data, do not fit the min field strength, or overlap with an existing flux rope candidate of longer duration
-        # we these windows from the start to improve performance
-        mask = ~torch.any(torch.any(torch.isnan(windows), dim=2), dim=1) & \
-                (torch.norm(windows[:, :, :3], dim=2).mean(dim=1) >= min_strength) & \
-                ~torch.any(overlap_batches, dim=1)
+        class WindowDataset(IterableDataset):
+            def __init__(self):
+                self.start = 0
+                self.end = windows.shape[0]
 
-        windows = windows[mask]
-        window_starts = window_starts[mask]
+            def __iter__(self):
+                self.i = None
+                return self
+        
+            def __next__(self):
+                if self.i is None:
+                    self.i = self.start
+                else:
+                    self.i += 1
 
-        # skip if no windows remain after applying the mask
-        if len(windows) == 0:
-            continue
+                if self.i >= self.end:
+                    raise StopIteration
 
-        class WindowDataset(Dataset):
-            def __getitem__(self, index):
-                return window_starts[index], windows[index]
+                # transpose to make it so the dimensions are (batch, time, physical quantity)
+                window_data = windows[self.i].T
+                if torch.norm(window_data[:, :3], dim=-1).mean() < min_strength:
+                    return self.__next__()
             
-            def __len__(self):
-                return len(windows)
+                if torch.any(overlap_batches[self.i]):
+                    return self.__next__()
+
+                if torch.any(torch.isnan(window_data)):
+                    return self.__next__()
+
+                return window_starts[self.i], window_data
+
         dataloader = DataLoader(WindowDataset(), batch_size, pin_memory=cuda)
 
         # iterate the windows of the same duration in batches to avoid running out of memory
