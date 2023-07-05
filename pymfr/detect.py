@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
+from torch.utils.data import Dataset, DataLoader
 
 from scipy.signal import savgol_filter
 
@@ -105,15 +106,16 @@ def detect_flux_ropes(magnetic_field,
         if len(windows) == 0:
             continue
 
-        if cuda:
-            windows.pin_memory("cuda")
-            window_starts.pin_memory("cuda")
+        class WindowDataset(Dataset):
+            def __getitem__(self, index):
+                return window_starts[index], windows[index]
+            
+            def __len__(self):
+                return len(windows)
+        dataloader = DataLoader(WindowDataset(), batch_size, pin_memory=cuda)
 
         # iterate the windows of the same duration in batches to avoid running out of memory
-        for i_batch in reversed(range(0, len(windows), batch_size)):
-            batch_data = windows[i_batch:i_batch + batch_size]
-            batch_starts = window_starts[i_batch:i_batch + batch_size]
-
+        for batch_starts, batch_data in dataloader:
             if cuda:
                 batch_data = batch_data.cuda(non_blocking=True)
                 batch_starts = batch_starts.cuda(non_blocking=True)
