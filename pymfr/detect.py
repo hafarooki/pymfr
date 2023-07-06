@@ -299,13 +299,14 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
     if not torch.all(~too_close):
         # use pca to determine a guess y axis (useful if the non-y axis with average zero is a constant zero with maybe small noise)
         too_close_field = magnetic_field[too_close]
+        too_close_mean_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
         too_close_frames = frames[too_close]
-        too_close_directions = path_direction[too_close]
-        perpendicular_field = too_close_field - (too_close_directions.unsqueeze(-2) * too_close_field).sum(dim=-1, keepdims=True) * too_close_directions.unsqueeze(-2)
+        too_close_path_directions = path_direction[too_close]
+        perpendicular_field = too_close_field - (too_close_path_directions.unsqueeze(-2) * too_close_field).sum(dim=-1, keepdims=True) * too_close_path_directions.unsqueeze(-2)
         principal_directions = torch.linalg.svd(perpendicular_field, full_matrices=False)[2][:, 0, :]
-        assert torch.all(torch.abs((principal_directions * too_close_directions).sum(dim=-1)) < .001), "principal direction not perpendicular to velocity??"
+        assert torch.all(torch.abs((principal_directions * too_close_path_directions).sum(dim=-1)) < .001), "principal direction not perpendicular to velocity??"
 
-        alternative_directions = F.normalize(torch.cross(principal_directions, too_close_directions, dim=-1))
+        alternative_directions = F.normalize(torch.cross(principal_directions, too_close_path_directions, dim=-1))
         
         n_vertical_trials = 180 // 4  # 4 degree separation -> 45 vertical axis guesses. Odd number is desirable
 
@@ -313,8 +314,8 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
         possible_vertical_directions = F.normalize(principal_directions.unsqueeze(1) * torch.cos(theta) + alternative_directions.unsqueeze(1) * torch.sin(theta), dim=-1)
         
         # ensure that x unit points opposite direction of frames
-        x_unit = F.normalize(torch.cross(possible_vertical_directions, mean_magnetic_field_directions.unsqueeze(1), dim=-1), dim=-1)
-        x_unit_sign = -torch.sign((x_unit * frames.unsqueeze(1)).sum(dim=-1, keepdim=True))
+        x_unit = F.normalize(torch.cross(possible_vertical_directions, too_close_mean_directions.unsqueeze(1), dim=-1), dim=-1)
+        x_unit_sign = -torch.sign((x_unit * too_close_frames.unsqueeze(1)).sum(dim=-1, keepdim=True))
         possible_vertical_directions *= x_unit_sign
 
         # use for loop to avoid running out of memory with a large batch size
@@ -415,6 +416,7 @@ def _count_inflection_points(potential):
         window_size += 1
     filter = torch.as_tensor(savgol_coeffs(window_size, 3), dtype=potential.dtype, device=potential.device)
     smoothed = torch.conv1d(potential.unsqueeze(1), filter[None, None, :], padding="valid").squeeze(1)
+    # TODO: Fix this padding!
 
     is_sign_change = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).to(int)
 
