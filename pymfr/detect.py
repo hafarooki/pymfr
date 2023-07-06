@@ -119,17 +119,18 @@ def detect_flux_ropes(magnetic_field,
             batch_velocity = batch_data[:, :, 3:6]
             batch_gas_pressure = batch_data[:, :, 9]
 
-            # first find the velocity frames
-            batch_frames = _find_frames(batch_magnetic_field,
-                                            batch_velocity,
-                                            n_axis_iterations,
-                                            n_trial_axes,
-                                            max_axis_determination_resolution,
-                                            frame_type,
-                                            max_clip=window_step,
-                                            axis_optimizer=axis_optimizer)
+            batch_frames = _find_frames(batch_magnetic_field, batch_velocity, frame_type)
         
-            batch_vertical_direction = _determine_vertical_directions(batch_magnetic_field, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, window_step, axis_optimizer)
+            max_clip = window_step
+
+            batch_vertical_direction = _determine_vertical_directions(batch_magnetic_field,
+                                                                      batch_frames,
+                                                                      n_axis_iterations,
+                                                                      n_trial_axes,
+                                                                      max_axis_determination_resolution,
+                                                                      max_clip,
+                                                                      axis_optimizer,
+                                                                      batch_size)
             
             batch_normalized_potential = _calculate_normalized_potential(batch_magnetic_field, batch_vertical_direction, batch_frames)
 
@@ -155,7 +156,7 @@ def detect_flux_ropes(magnetic_field,
             # use the potential peaks as the inflection points
             inflection_points = batch_normalized_potential[..., 1:-1].abs().argmax(dim=1) + 1            
             
-            batch_axes = _minimize_axis_residue(batch_magnetic_field, batch_vertical_direction, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, window_step, axis_optimizer, return_residue=False)
+            batch_axes = _minimize_axis_residue(batch_magnetic_field, batch_vertical_direction, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, return_residue=False)
 
             # rotate the magnetic field data into the flux rope coordinate system
             rotated_field = _rotate_field(batch_axes, batch_magnetic_field, batch_frames)
@@ -211,7 +212,7 @@ def detect_flux_ropes(magnetic_field,
                                                    "error_fit"])
 
 
-def _find_frames(magnetic_field, velocity, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, frame_type, max_clip, axis_optimizer):
+def _find_frames(magnetic_field, velocity, frame_type):
 
 
     if frame_type == "mean_velocity":
@@ -274,7 +275,7 @@ def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames,
 
 
 
-def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer):
+def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, batch_size):
     # Implements a trick I came up with to narrow down the orientation possibilities--
     # essentially, we can determine the y direction analytically
     # because <\vec{B}> is perp to y since -int_0^1 By dx = A_f - A_0 = 0 and x \propto t
@@ -308,7 +309,7 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
 
         alternative_directions = F.normalize(torch.cross(principal_directions, too_close_path_directions, dim=-1))
         
-        n_vertical_trials = 180 // 4  # 4 degree separation -> 45 vertical axis guesses. Odd number is desirable
+        n_vertical_trials = 180  # 4 degree separation -> 45 vertical axis guesses. Odd number is desirable
 
         theta = torch.linspace(-np.pi / 2, np.pi / 2, n_vertical_trials, device=principal_directions.device).reshape(1, n_vertical_trials, 1)
         possible_vertical_directions = F.normalize(principal_directions.unsqueeze(1) * torch.cos(theta) + alternative_directions.unsqueeze(1) * torch.sin(theta), dim=-1)
@@ -318,16 +319,55 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
         x_unit_sign = -torch.sign((x_unit * too_close_frames.unsqueeze(1)).sum(dim=-1, keepdim=True))
         possible_vertical_directions *= x_unit_sign
 
-        # use for loop to avoid running out of memory with a large batch size
-        min_residue = torch.stack([_minimize_axis_residue(too_close_field,
-                                                    possible_vertical_directions[:, i, :],
-                                                    too_close_frames,
+        n_too_close = len(too_close_field)
+
+        # number processed = n in vertical axis batch * n too close
+        # -> n in axis batch = number processed / n too close
+        # max number processed (ideal for batch processing) would be
+        # total number of trial vertical axes * n too close
+        # but it cant be more than batch size
+        # also must have minimum axis batch size 1 to get anywhere
+        # hence the following line of code makes sense
+        axis_batch_step = max(1, min(n_vertical_trials * n_too_close, batch_size) // n_too_close)
+
+        minimum_residues = []  # best residue attainable for each vertical axis
+
+        for i_axis_batch in range(0, n_vertical_trials, axis_batch_step):
+            axis_batch_size = min(i_axis_batch + axis_batch_step, n_vertical_trials) - i_axis_batch
+            
+            # looks like [B1, B1, B1, B2, B2, B2] if axis_batch_size = 3 and n_too_close=2
+            axis_batch_field = torch.repeat_interleave(too_close_field, axis_batch_size, dim=0)
+            axis_batch_frames = torch.repeat_interleave(too_close_frames, axis_batch_size, dim=0)
+            
+            # looks like [axis1a, axis1b, axis1c, axis2a, axis2b, axis2c] 
+            axis_batch_directions = possible_vertical_directions[:, i_axis_batch:i_axis_batch + axis_batch_size, :].reshape(-1, 3)
+            
+            axis_batch_potential = _calculate_normalized_potential(axis_batch_field,
+                                                                   axis_batch_directions,
+                                                                   axis_batch_frames)
+            axis_batch_inflection_mask = _count_inflection_points(axis_batch_potential) == 1
+
+            axis_batch_min_residue = torch.ones(len(axis_batch_directions),
+                                                dtype=axis_batch_directions.dtype,
+                                                device=axis_batch_directions.device) * torch.inf
+            axis_batch_min_residue[axis_batch_inflection_mask] = _minimize_axis_residue(axis_batch_field[axis_batch_inflection_mask],
+                                                    axis_batch_directions[axis_batch_inflection_mask],
+                                                    axis_batch_frames[axis_batch_inflection_mask],
                                                     n_axis_iterations,
                                                     n_trial_axes,
                                                     max_axis_determination_resolution,
                                                     max_clip,
-                                                    axis_optimizer)[1] for i in range(n_vertical_trials)], dim=-1)
-        _, argmin = min_residue.min(dim=-1)
+                                                    axis_optimizer)[1]
+    
+
+            # each entry of minimum_residues looks like
+            # [[residue1a, residue1b, residue1c], [residue2a, residue2b, residue2c]]
+            minimum_residues.append(axis_batch_min_residue.reshape(n_too_close, axis_batch_size))
+        
+        # looks like [[residue1a, ..., residue1z], [residue2a, ..., residue2z]]
+        min_residue = torch.concat(minimum_residues, dim=1)
+        assert min_residue.shape == (n_too_close, n_vertical_trials)
+        argmin = min_residue.argmin(dim=-1)
         index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
         vertical_directions[too_close] = possible_vertical_directions.gather(-2, index).squeeze(-2)
 
