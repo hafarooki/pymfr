@@ -299,7 +299,7 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
     if not torch.all(~too_close):
         # use pca to determine a guess y axis (useful if the non-y axis with average zero is a constant zero with maybe small noise)
         too_close_field = magnetic_field[too_close]
-        too_close_mean_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
+        too_close_mean_directions = mean_magnetic_field_directions[too_close]
         too_close_frames = frames[too_close]
         too_close_path_directions = path_direction[too_close]
         perpendicular_field = too_close_field - (too_close_path_directions.unsqueeze(-2) * too_close_field).sum(dim=-1, keepdims=True) * too_close_path_directions.unsqueeze(-2)
