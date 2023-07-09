@@ -38,8 +38,12 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
 
     dependent_values = torch.cross(electric_field, magnetic_field, dim=-1).mean(dim=-2)
 
-    fitting_result = torch.linalg.lstsq(coefficient_matrix, dependent_values)
-    return fitting_result.solution
+    # I am not sure why, but this seems to give better results than torch.linalg.lstsq on GPU
+    # the pinv method is closer to the result form torch.linalg.lstsq on CPU and np.linalg.lstsq
+    # furthermore, torch.linalg.lstsq sometimes give LinAlgError in batch mode the input matrix is not full rank,
+    # even though it works fine if applied individually
+    fitting_result = (torch.linalg.pinv(coefficient_matrix, hermitian=True) @ dependent_values.unsqueeze(2)).squeeze(2)
+    return fitting_result
 
 
 def estimate_ht2d_frame(magnetic_field: torch.tensor,

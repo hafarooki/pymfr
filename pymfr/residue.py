@@ -69,11 +69,6 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant, 
     # infinity if 0 field_line_invariant range
     error_diff = torch.where(field_line_invariant_range > 0, error_diff, torch.inf)
 
-    # peak field_line_invariant must be on top
-    peak_field_line_invariant = field_line_invariant.gather(1, inflection_points.unsqueeze(1)).squeeze(1)
-    average_field_line_invariant = field_line_invariant.quantile(0.85, dim=1)
-    error_diff = torch.where(peak_field_line_invariant > average_field_line_invariant, error_diff, torch.inf)
-
     # require a minimum amount of each branch after trimming
     max_clip = max_clip if max_clip is not None else duration // 2
     error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)

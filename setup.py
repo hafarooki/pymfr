@@ -7,7 +7,7 @@ except ImportError:
 
 setup(
     name="pymfr",
-    version="1.3.1",
+    version="1.3.2",
     author="Hameedullah A. Farooki",
     author_email="haf5@njit.edu",
     packages=["pymfr"],
