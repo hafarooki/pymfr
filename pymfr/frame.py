@@ -2,7 +2,8 @@ import torch
 
 
 def estimate_ht_frame(magnetic_field: torch.tensor,
-                      electric_field: torch.tensor):
+                      electric_field: torch.tensor,
+                      estimate_uncertainty=False):
     """
     Estimate the DeHoffman-Teller (HT) frame based on magnetic field and electric field data such that
     the electric field in such a frame is zero.
@@ -36,14 +37,22 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
         for j in range(3):
             coefficient_matrix[..., i, j] = coefficients[i][j].mean(dim=-1)
 
-    dependent_values = torch.cross(electric_field, magnetic_field, dim=-1).mean(dim=-2)
-
     # I am not sure why, but this seems to give better results than torch.linalg.lstsq on GPU
     # the pinv method is closer to the result form torch.linalg.lstsq on CPU and np.linalg.lstsq
     # furthermore, torch.linalg.lstsq sometimes give LinAlgError in batch mode the input matrix is not full rank,
     # even though it works fine if applied individually
-    fitting_result = (torch.linalg.pinv(coefficient_matrix, hermitian=True) @ dependent_values.unsqueeze(2)).squeeze(2)
-    return fitting_result
+    inverse_matrix = torch.linalg.pinv(coefficient_matrix, hermitian=True)
+    dependent_values = torch.cross(electric_field, magnetic_field, dim=-1).mean(dim=-2)
+    fitting_result = (inverse_matrix @ dependent_values.unsqueeze(2)).squeeze(2)
+
+    if not estimate_uncertainty:
+        return fitting_result
+
+    remaining_electric_field = electric_field + torch.cross(fitting_result.unsqueeze(-2), magnetic_field, dim=-1)
+    dependent_values = torch.cross(remaining_electric_field, magnetic_field, dim=-1).mean(dim=-2)
+    uncertainty = (inverse_matrix @ dependent_values.unsqueeze(2)).squeeze(2)
+
+    return fitting_result, uncertainty
 
 
 def estimate_ht2d_frame(magnetic_field: torch.tensor,

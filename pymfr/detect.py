@@ -30,6 +30,7 @@ def detect_flux_ropes(magnetic_field,
                       threshold_walen=0.3,
                       n_axis_iterations=1,
                       n_trial_axes=180 // 4,
+                      max_processing_resolution=None,
                       max_axis_determination_resolution=None,
                       min_positive_axial_component=0.95,
                       cuda=True,
@@ -57,7 +58,7 @@ def detect_flux_ropes(magnetic_field,
         Simply takes the average velocity over the window. Fastest but least precise.
     - "vht":
         Finds the frame that minimizes the averaged electric field magnitude squared.
-    :param threshold_frame: Maximum D/D0 (Khabrov and SOnnerup, 1998). Default 0.1.
+    :param threshold_frame: Maximum D/D0 (Khabrov and Sonnerup, 1998). Default 0.1.
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
     :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
@@ -68,6 +69,7 @@ def detect_flux_ropes(magnetic_field,
     This feature is different from the original GS automated detection algorithm. Similar behavior can be obtained with `n_axis_iterations = 1`.
     :param n_trial_axes: The number of evenly spaced guess orientations used for the axis determination algorithm.
     Odd number is desirable so that one of the trial axes includes the previous iteration's best orientation (starting with avg field direction).
+    :param max_processing_resolution: Scale sliding windows down to this size (if larger) before loading them to GPU to reduce memory usage.
     :param max_axis_determination_resolution: Maximum size of samples used for axis determination algorithm residue calculation.
     Useful to limit since it makes it much faster to use less data for this intensive part of the algorithm.
     If the number of samples is greater than this amount, it is downsampled with adaptive average pooling.
@@ -109,6 +111,9 @@ def detect_flux_ropes(magnetic_field,
             
             batch_starts = batch_starts[initial_mask]
             batch_data = batch_data[initial_mask]
+
+            if max_processing_resolution is not None and duration > max_processing_resolution:
+                batch_data = torch.adaptive_avg_pool1d(batch_data.transpose(1, 2), max_processing_resolution).transpose(1, 2)
 
             if len(batch_data) == 0:
                 continue
@@ -206,6 +211,7 @@ def detect_flux_ropes(magnetic_field,
 
         # done at the end of processing all batches with a given duration
         _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit)
+        torch.cuda.empty_cache()
 
     remaining_events = list(sorted(remaining_events, key=lambda x: x[1]))
     return pd.DataFrame(remaining_events, columns=["error_diff", "start", "end", "duration",
