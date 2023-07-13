@@ -213,12 +213,11 @@ def detect_flux_ropes(magnetic_field,
                 if event_index in event_candidates:
                     if error_diff_i >= event_candidates[event_index][0]:
                         continue
+                
+                error_fit = _calculate_residue_fit(batch_normalized_potential[i], transverse_pressure[i]).item()
 
-                if threshold_fit is not None:
-                    error_fit = _calculate_residue_fit(batch_normalized_potential[i], transverse_pressure[i]).item()
-
-                    if error_fit > threshold_fit:
-                        continue
+                if threshold_fit is not None and error_fit > threshold_fit:
+                    continue
 
                 start = start
                 end = start + duration - 1
