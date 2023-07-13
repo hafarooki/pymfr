@@ -24,10 +24,11 @@ def detect_flux_ropes(magnetic_field,
                       window_steps,
                       min_strength,
                       frame_type="vht",
-                      threshold_frame=0.1,
+                      threshold_frame_quality=0.9,
                       threshold_diff=0.12,
                       threshold_fit=0.14,
                       threshold_walen=0.3,
+                      threshold_flow_field_alignment=None,
                       n_axis_iterations=1,
                       n_trial_axes=180 // 4,
                       max_processing_resolution=None,
@@ -58,10 +59,14 @@ def detect_flux_ropes(magnetic_field,
         Simply takes the average velocity over the window. Fastest but least precise.
     - "vht":
         Finds the frame that minimizes the averaged electric field magnitude squared.
-    :param threshold_frame: Maximum D/D0 (Khabrov and Sonnerup, 1998). Default 0.1.
+    :param threshold_frame_quality: Minimum correlation coefficient for the HT frame (Khabrov and Sonnerup, 1998). Default 0.9.
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
-    :param threshold_walen: The Walen slope threshold for excluding Alfven waves.
+    :param threshold_walen: The Walen slope threshold to determine if there is significant Alfvenicity.
+    :param threshold_flow_field_alignment: The threshold for the average absolute value of the
+    dot product between normalized remaining flow and normalized magnetic field if threshold_walen is not met.
+    If flux ropes with field aligned flows are not desired, then set to None.
+    Default None.
     :param n_axis_iterations: Number of iterations for axis determination algorithm.
     Each iteration `i in {0, ..., n_axis_iterations - 1}` will scan a region of angular width $\pi/2^i$
     centered around the previous best orientation (using avg magnetic field direction as an initial guess)
@@ -127,8 +132,8 @@ def detect_flux_ropes(magnetic_field,
             batch_velocity = batch_data[:, :, 3:6]
             batch_gas_pressure = batch_data[:, :, 9]
 
-            batch_frames, frame_error = _find_frames(batch_magnetic_field, batch_velocity, frame_type)
-            frame_mask = frame_error < threshold_frame
+            batch_frames, frame_quality = _find_frames(batch_magnetic_field, batch_velocity, frame_type)
+            frame_mask = frame_quality > threshold_frame_quality
         
             max_clip = window_step
 
@@ -146,7 +151,11 @@ def detect_flux_ropes(magnetic_field,
             inflection_point_mask = _count_inflection_points(batch_normalized_potential) == 1
 
             # estimate alfvenicity using walen slope
-            alfvenicity_mask = _calculate_alfvenicity(batch_frames, batch_data) <= threshold_walen
+            walen_slope, flow_field_alignment = _calculate_alfvenicity(batch_frames, batch_data)
+            alfvenicity_mask = torch.abs(walen_slope) <= threshold_walen
+
+            if threshold_flow_field_alignment is not None:
+                alfvenicity_mask = alfvenicity_mask | (torch.abs(flow_field_alignment) >= threshold_flow_field_alignment)
 
             mask = frame_mask & inflection_point_mask & alfvenicity_mask
             
@@ -162,6 +171,9 @@ def detect_flux_ropes(magnetic_field,
             batch_vertical_direction = batch_vertical_direction[mask]
             batch_normalized_potential = batch_normalized_potential[mask]     
             inflection_points = inflection_points[mask]       
+            walen_slope = walen_slope[mask]       
+            frame_quality = frame_quality[mask]     
+            flow_field_alignment = flow_field_alignment[mask]  
             
             batch_axes = _minimize_axis_residue(batch_magnetic_field, batch_vertical_direction, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, return_residue=False)
 
@@ -182,10 +194,15 @@ def detect_flux_ropes(magnetic_field,
             # combine all the masks
             mask = pressure_peak_mask & mask_positive_Bz
             
-            # calculate difference residue
-            error_diff = torch.ones(len(mask), dtype=batch_data.dtype, device=batch_data.device) * np.nan
+            # calculate difference residue for axis residue based on just Bz first,
+            # since gas pressure does not affect whether the axis is well determined
+            # calculate residue is an expensive operation so it is only done on the ones meeting the other masks
+            axis_residue = torch.ones(len(mask), dtype=batch_data.dtype, device=batch_data.device) * np.nan
+            axis_residue[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], rotated_field[:, :, 2][mask], max_clip=max_clip)
+            mask &= (axis_residue <= threshold_diff)
+
+            error_diff = torch.ones_like(axis_residue) * np.nan
             error_diff[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], transverse_pressure[mask], max_clip=max_clip)
-            mask &= (error_diff <= threshold_diff)
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
@@ -197,27 +214,44 @@ def detect_flux_ropes(magnetic_field,
                     if error_diff_i >= event_candidates[event_index][0]:
                         continue
 
-                error_fit = _calculate_residue_fit(batch_normalized_potential[i], transverse_pressure[i])
+                if threshold_fit is not None:
+                    error_fit = _calculate_residue_fit(batch_normalized_potential[i], transverse_pressure[i]).item()
+
+                    if error_fit > threshold_fit:
+                        continue
 
                 start = start
                 end = start + duration - 1
-                event_candidates[event_index] = (error_diff_i,
-                                                 start,
+                event_candidates[event_index] = (start,
                                                  end,
                                                  duration,
+                                                 error_diff_i,
+                                                 error_fit,
+                                                 walen_slope[i].item(),
+                                                 frame_quality[i].item(),
+                                                 flow_field_alignment[i].item(),
                                                  *tuple(batch_axes[i].cpu().numpy()),
-                                                 *tuple(batch_frames[i].cpu().numpy()),
-                                                 error_fit.item())
+                                                 *tuple(batch_frames[i].cpu().numpy()))
 
         # done at the end of processing all batches with a given duration
         _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit)
         torch.cuda.empty_cache()
 
     remaining_events = list(sorted(remaining_events, key=lambda x: x[1]))
-    return pd.DataFrame(remaining_events, columns=["error_diff", "start", "end", "duration",
-                                                   "axis_x", "axis_y", "axis_z",
-                                                   "frame_x", "frame_y", "frame_z",
-                                                   "error_fit"])
+    return pd.DataFrame(remaining_events, columns=["start",
+                                                   "end",
+                                                   "duration",
+                                                   "error_diff", 
+                                                   "error_fit",
+                                                   "walen_slope",
+                                                   "frame_quality",
+                                                   "flow_field_alignment",
+                                                   "axis_x",
+                                                   "axis_y",
+                                                   "axis_z",
+                                                   "frame_x",
+                                                   "frame_y",
+                                                   "frame_z"])
 
 
 def _find_frames(magnetic_field, velocity, frame_type):
@@ -233,8 +267,9 @@ def _find_frames(magnetic_field, velocity, frame_type):
     remaining_electric_field = -torch.cross(velocity - frames.unsqueeze(1), magnetic_field, dim=2)
 
     frame_error = (torch.sum(remaining_electric_field ** 2, dim=-1) / torch.sum(electric_field ** 2, dim=2)).mean(dim=1)
+    frame_quality = torch.sqrt(1 - frame_error)
 
-    return frames, frame_error
+    return frames, frame_quality
 
 
 def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, return_residue=True):
@@ -422,42 +457,38 @@ def _get_sliding_windows(window_lengths, window_steps):
 
 
 def _cleanup_candidates(contains_existing, event_candidates, remaining_events, threshold_fit):
-    # sort by end time
-    event_candidates = dict(sorted(event_candidates.items(), reverse=False, key=lambda item: item[1][1]))
+    # sort by difference residue (instead of end time, as the original algorithm did)
+    event_candidates = dict(sorted(event_candidates.items(), reverse=False, key=lambda item: item[1][3]))
     for key in list(event_candidates.keys()):
         if key not in event_candidates:
             continue
         event = event_candidates[key]
         del event_candidates[key]
 
-        error_fit = event[-1]
-
-        start = event[1]
-        end = event[2]
-        duration = event[3]
-
-        if error_fit > threshold_fit:
-            continue
+        start = event[0]
+        end = event[1]
+        duration = event[2]
 
         remaining_events.append(event)
         contains_existing[start:start + duration] = True
 
         for other_key in list(event_candidates.keys()):
-            ends_before = event_candidates[other_key][2] < start
-            starts_after = event_candidates[other_key][1] > end
+            ends_before = event_candidates[other_key][1] < start
+            starts_after = event_candidates[other_key][0] > end
             if ends_before or starts_after:
                 continue
 
             del event_candidates[other_key]
 
 
-def _calculate_alfvenicity(frame, windows):
-    remaining_flow = (windows[:, :, 3:6] - frame.unsqueeze(1)).squeeze(1).flatten(1)
-    alfven_velocity = windows[:, :, 6:9].flatten(1)
+def _calculate_alfvenicity(batch_frames, batch_data):
+    remaining_flow = (batch_data[:, :, 3:6] - batch_frames.unsqueeze(1)).squeeze(1)
+    alfven_velocity = batch_data[:, :, 6:9]
     d_flow = remaining_flow - remaining_flow.mean(dim=1, keepdim=True)
     d_alfven = alfven_velocity - alfven_velocity.mean(dim=1, keepdim=True)
-    walen_slope = (d_flow * d_alfven).sum(dim=1) / (d_alfven ** 2).sum(dim=1)
-    return torch.abs(walen_slope)
+    walen_slope = (d_flow.flatten(1) * d_alfven.flatten(1)).sum(dim=1) / (d_alfven.flatten(1) ** 2).sum(dim=1)
+    field_alignment = (F.normalize(remaining_flow, dim=2) * F.normalize(alfven_velocity, dim=2)).sum(dim=2).mean(dim=1)
+    return walen_slope, field_alignment
 
 
 def _count_inflection_points(potential):
