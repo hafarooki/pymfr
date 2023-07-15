@@ -6,19 +6,19 @@ import torch.nn.functional as F
 from pymfr.residue import _calculate_residue_diff
 
 
-def minimize_rdiff(magnetic_field, frame_velocity, trial_axes, max_clip=None):
+def minimize_rdiff(magnetic_field, frame_velocity, trial_axes):
     """
     WIP API for finding best axis using Rdiff as a criteria
     """
 
-    rdiff = calculate_residue_map(magnetic_field, frame_velocity, trial_axes, max_clip=max_clip)
+    rdiff = calculate_residue_map(magnetic_field, frame_velocity, trial_axes)
     rdiff, argmin = rdiff.min(dim=-1)
     index = argmin.unsqueeze(-1).unsqueeze(-1).expand(*[-1] * len(magnetic_field.shape[:-2]), -1, 3)
     trial_axes = trial_axes.gather(-2, index).squeeze(-2)
     return trial_axes, rdiff
 
 
-def calculate_residue_map(magnetic_field, frame_velocity, trial_axes, max_clip=None):
+def calculate_residue_map(magnetic_field, frame_velocity, trial_axes):
     """
     WIP API
     """
@@ -46,8 +46,7 @@ def calculate_residue_map(magnetic_field, frame_velocity, trial_axes, max_clip=N
     inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
     rdiff = _calculate_residue_diff(inflection_points.reshape(-1),
                                     potential.reshape(-1, duration),
-                                    field_line_invariant.reshape(-1, duration),
-                                    max_clip).reshape(*batch_size, n_trial_axes)
+                                    field_line_invariant.reshape(-1, duration)).reshape(*batch_size, n_trial_axes)
     return rdiff
 
 

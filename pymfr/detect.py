@@ -1,15 +1,12 @@
-from typing import Iterator
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm as tqdm
-from torch.utils.data import Dataset, DataLoader
-import math
 
 from scipy.signal import savgol_coeffs
 
-from pymfr.axis import _rotate_field, calculate_residue_map
+from pymfr.axis import calculate_residue_map
 from pymfr.frame import estimate_ht_frame
 
 from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit
@@ -134,15 +131,13 @@ def detect_flux_ropes(magnetic_field,
 
             batch_frames, frame_quality = _find_frames(batch_magnetic_field, batch_velocity, frame_type)
             frame_mask = frame_quality > threshold_frame_quality
-        
-            max_clip = window_step
+    
 
             batch_vertical_direction = _determine_vertical_directions(batch_magnetic_field,
                                                                       batch_frames,
                                                                       n_axis_iterations,
                                                                       n_trial_axes,
                                                                       max_axis_determination_resolution,
-                                                                      max_clip,
                                                                       axis_optimizer,
                                                                       batch_size)
             
@@ -175,13 +170,12 @@ def detect_flux_ropes(magnetic_field,
             frame_quality = frame_quality[mask]     
             flow_field_alignment = flow_field_alignment[mask]  
             
-            batch_axes = _minimize_axis_residue(batch_magnetic_field, batch_vertical_direction, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, return_residue=False)
+            batch_axes = _minimize_axis_residue(batch_magnetic_field, batch_vertical_direction, batch_frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, axis_optimizer, return_residue=False)
 
-            # rotate the magnetic field data into the flux rope coordinate system
-            rotated_field = _rotate_field(batch_axes, batch_magnetic_field, batch_frames)
+            axial_component = torch.sum(batch_magnetic_field * batch_axes.unsqueeze(-2), dim=-1)
             
             # calculate $p_t = B_z^2/2mu_0 + p$
-            transverse_magnetic_pressure = (rotated_field[:, :, 2] * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
+            transverse_magnetic_pressure = (axial_component * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
             transverse_pressure = batch_gas_pressure + transverse_magnetic_pressure
             
             # require the inflection point pressure to be within the top 85%
@@ -189,7 +183,7 @@ def detect_flux_ropes(magnetic_field,
             pressure_peak_mask = peak_pressure > torch.quantile(transverse_pressure, 0.85, dim=1, interpolation="lower")
 
             # require a certain percentage of Bz to be positive
-            mask_positive_Bz = (rotated_field[:, :, 2] > 0).to(torch.float32).mean(dim=-1) > min_positive_axial_component
+            mask_positive_Bz = (axial_component > 0).to(torch.float32).mean(dim=-1) > min_positive_axial_component
 
             # combine all the masks
             mask = pressure_peak_mask & mask_positive_Bz
@@ -198,11 +192,12 @@ def detect_flux_ropes(magnetic_field,
             # since gas pressure does not affect whether the axis is well determined
             # calculate residue is an expensive operation so it is only done on the ones meeting the other masks
             axis_residue = torch.ones(len(mask), dtype=batch_data.dtype, device=batch_data.device) * np.nan
-            axis_residue[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], rotated_field[:, :, 2][mask], max_clip=max_clip)
+            axis_residue[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], axial_component[mask])
             mask &= (axis_residue <= threshold_diff)
 
             error_diff = torch.ones_like(axis_residue) * np.nan
-            error_diff[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], transverse_pressure[mask], max_clip=max_clip)
+            error_diff[mask] = _calculate_residue_diff(inflection_points[mask], batch_normalized_potential[mask], transverse_pressure[mask])
+            mask &= (error_diff <= threshold_diff)
 
             for i in torch.nonzero(mask).flatten():
                 inflection_point = inflection_points[i]
@@ -271,13 +266,17 @@ def _find_frames(magnetic_field, velocity, frame_type):
     return frames, frame_quality
 
 
-def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, return_residue=True):
+def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, axis_optimizer, return_residue=True):
     if axis_optimizer is not None:
         axes = axis_optimizer(magnetic_field, frames, vertical_directions)
         if return_residue:
-            residue = calculate_residue_map(magnetic_field, frames, axes.unsqueeze(1), max_clip=max_clip).squeeze(-1)
+            residue = calculate_residue_map(magnetic_field, frames, axes.unsqueeze(1)).squeeze(-1)
     else:
-        axes = F.normalize(magnetic_field.mean(dim=1), dim=-1)
+        # use avg magnetic field as initial guess
+        initial_guess = magnetic_field.mean(dim=-2)
+        # ensure perpendicular to vertical direction
+        initial_guess = initial_guess - (initial_guess * vertical_directions).sum(dim=-1, keepdims=True) * vertical_directions
+        axes = F.normalize(initial_guess, dim=-1)
         
         if max_axis_determination_resolution is not None and magnetic_field.shape[1] > max_axis_determination_resolution:
             magnetic_field_short = F.adaptive_avg_pool1d(magnetic_field.transpose(1, 2), max_axis_determination_resolution).transpose(1, 2)
@@ -286,7 +285,7 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_i
         
         for i in range(n_axis_iterations):
             spread = 1 / (2 ** i)
-            axes, residue = _minimize_axis_residue_narrower(magnetic_field_short, vertical_directions, frames, n_trial_axes, max_clip, axes, spread)
+            axes, residue = _minimize_axis_residue_narrower(magnetic_field_short, vertical_directions, frames, n_trial_axes, axes, spread)
 
     if return_residue:
         return axes, residue
@@ -294,7 +293,7 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_i
         return axes
 
 
-def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames, n_trial_axes, max_clip, initial_axes, spread):
+def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames, n_trial_axes, initial_axes, spread):
     # generate trial axes by rotating <B> around the vertical axis (we expect z to be <B> +- 90 degrees around y, since <Bz> should be positive)
     alternative_directions = F.normalize(torch.cross(vertical_directions, initial_axes), dim=-1)
     angle = torch.linspace(-np.pi / 2 * spread, np.pi / 2 * spread, n_trial_axes, device=initial_axes.device).reshape(1, n_trial_axes, 1)
@@ -304,7 +303,7 @@ def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames,
     # This is because gas pressure error diff is not affected by rotations about the y axis
     # unlike Bz, which depends on the axis orientation
     # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
-    error_diff_axis = calculate_residue_map(magnetic_field, frames, trial_axes, max_clip=max_clip)
+    error_diff_axis = calculate_residue_map(magnetic_field, frames, trial_axes)
 
     # select the best orientation
     residue, argmin = error_diff_axis.min(dim=-1)
@@ -314,7 +313,7 @@ def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames,
 
 
 
-def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, max_clip, axis_optimizer, batch_size):
+def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_trial_axes, max_axis_determination_resolution, axis_optimizer, batch_size):
     # Implements a trick I came up with to narrow down the orientation possibilities--
     # essentially, we can determine the y direction analytically
     # because <\vec{B}> is perp to y since -int_0^1 By dx = A_f - A_0 = 0 and x \propto t
@@ -325,7 +324,10 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
     
     # direction of spacecraft motion through flux rope axis and cross section
     path_direction = F.normalize(-frames, dim=-1)
-    mean_magnetic_field_directions = F.normalize(magnetic_field.mean(dim=1), dim=-1)
+
+    # evaluate average magnetic field using numerical integration to ensure that integral of vertical direction is zero
+    mean_magnetic_field = torch.trapezoid(magnetic_field, dim=1) / magnetic_field.shape[1]
+    mean_magnetic_field_directions = F.normalize(mean_magnetic_field, dim=-1)
 
     cross_product = torch.cross(mean_magnetic_field_directions, path_direction, dim=-1)
 
@@ -333,7 +335,7 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
 
     # compare ratio of average along guessed vertical direction and the one perpendicular. if less than 10x difference, not well determined 
     perpendicular_direction = F.normalize(torch.cross(path_direction, vertical_directions), dim=-1)
-    ratio = (magnetic_field * vertical_directions.unsqueeze(1)).sum(dim=2).mean(dim=1).abs() / (magnetic_field * perpendicular_direction.unsqueeze(1)).sum(dim=2).mean(dim=1).abs()
+    ratio = ((mean_magnetic_field * vertical_directions).sum(dim=-1) / (mean_magnetic_field * perpendicular_direction).sum(dim=-1)).abs()
     too_close = (ratio > 0.1) | (torch.norm(vertical_directions, dim=-1) == 0)  # also too close if norm of vertical direction is 0
 
     if not torch.all(~too_close):
@@ -400,7 +402,6 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
                                                     n_axis_iterations,
                                                     n_trial_axes,
                                                     max_axis_determination_resolution,
-                                                    max_clip,
                                                     axis_optimizer)[1]
     
 
@@ -491,11 +492,14 @@ def _calculate_alfvenicity(batch_frames, batch_data):
 
 
 def _count_inflection_points(potential):
-    window_size = potential.shape[1] // 2
-    if window_size % 2 == 0:
-        window_size += 1
-    filter = torch.as_tensor(savgol_coeffs(window_size, 3), dtype=potential.dtype, device=potential.device)
-    smoothed = torch.conv1d(potential.unsqueeze(1), filter[None, None, :], padding="same").squeeze(1)
+    # stricter smoothing than the original algorithm,
+    # because this implementation relies more heavily on having only a single inflection point
+    # since it does no trimming of the window size.
+    # based on my testing, doing this does not drastically reduce the number of quality flux ropes
+    # but it does greatly increase the quality of the flux ropes that are detected - H. Farooki
+
+    smoothing_scale = max(potential.shape[-1] // 10, 1)
+    smoothed = F.avg_pool1d(potential, kernel_size=smoothing_scale, count_include_pad=False, stride=1)
 
     is_sign_change = (torch.diff(torch.sign(torch.diff(smoothed))) != 0).to(int)
 

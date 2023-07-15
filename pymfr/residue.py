@@ -3,7 +3,7 @@ from torchinterp1d import Interp1d
 import numpy as np
 
 
-def _calculate_residue_diff(inflection_points, potential, field_line_invariant, max_clip=None):
+def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
     assert len(inflection_points.shape) == 1
     assert len(potential.shape) == 2
     assert len(field_line_invariant.shape) == 2
@@ -68,13 +68,6 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant, 
 
     # infinity if 0 field_line_invariant range
     error_diff = torch.where(field_line_invariant_range > 0, error_diff, torch.inf)
-
-    # require a minimum amount of each branch after trimming
-    max_clip = max_clip if max_clip is not None else duration // 2
-    error_diff = torch.where((((unclipped_mask & before).long().sum(dim=1) >= duration // 4)
-                              & ((unclipped_mask & after).long().sum(dim=1) >= duration // 4)
-                              & (unclipped_mask.long().sum(dim=1) >= duration - max_clip)
-                              ), error_diff, torch.inf)
 
     return error_diff
 
