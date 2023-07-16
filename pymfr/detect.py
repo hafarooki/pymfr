@@ -295,7 +295,7 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, frames, n_axis_i
 
 def _minimize_axis_residue_narrower(magnetic_field, vertical_directions, frames, n_trial_axes, initial_axes, spread):
     # generate trial axes by rotating <B> around the vertical axis (we expect z to be <B> +- 90 degrees around y, since <Bz> should be positive)
-    alternative_directions = F.normalize(torch.cross(vertical_directions, initial_axes), dim=-1)
+    alternative_directions = F.normalize(torch.cross(vertical_directions, initial_axes, dim=-1), dim=-1)
     angle = torch.linspace(-np.pi / 2 * spread, np.pi / 2 * spread, n_trial_axes, device=initial_axes.device).reshape(1, n_trial_axes, 1)
     trial_axes = F.normalize(initial_axes.unsqueeze(1) * torch.cos(angle) + alternative_directions.unsqueeze(1) * torch.sin(angle), dim=-1)
 
@@ -334,7 +334,7 @@ def _determine_vertical_directions(magnetic_field, frames, n_axis_iterations, n_
     vertical_directions = F.normalize(cross_product, dim=-1)
 
     # compare ratio of average along guessed vertical direction and the one perpendicular. if less than 10x difference, not well determined 
-    perpendicular_direction = F.normalize(torch.cross(path_direction, vertical_directions), dim=-1)
+    perpendicular_direction = F.normalize(torch.cross(path_direction, vertical_directions, dim=-1), dim=-1)
     ratio = ((mean_magnetic_field * vertical_directions).sum(dim=-1) / (mean_magnetic_field * perpendicular_direction).sum(dim=-1)).abs()
     too_close = (ratio > 0.1) | (torch.norm(vertical_directions, dim=-1) == 0)  # also too close if norm of vertical direction is 0
 
@@ -439,7 +439,7 @@ def _pack_data(magnetic_field, velocity, density, gas_pressure):
     # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
     # constant factor 21.8114 assumes B is in nT and n_p is in cm^-3
     # and v_A should be in km/s
-    alfven_velocity = (magnetic_field[:, :3] / torch.sqrt(density.unsqueeze(1))).flatten(1) * 21.8114
+    alfven_velocity = (magnetic_field[:, :3] / torch.sqrt(density.unsqueeze(1))) * 21.8114
 
     # combine needed data into one tensor
     return torch.concat([magnetic_field, velocity, alfven_velocity, gas_pressure], dim=1)
