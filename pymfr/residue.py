@@ -1,5 +1,5 @@
 import torch
-from torchinterp1d import Interp1d
+from torchinterp1d import interp1d
 import numpy as np
 
 
@@ -42,19 +42,25 @@ def _calculate_folding_differences(potential, quantity):
     folded_data[:, 2, :] = folded_data[:, 2, :].gather(1, sort2)
     folded_data[:, 3, :] = folded_data[:, 3, :].gather(1, sort2)
 
-    # scale x axis from 0 to 1
+    # scale x axis from ~0 to 1
     peak_values = folded_data[:, 2, :].amax(dim=-1, keepdim=True)
     folded_data[:, 0, :] /= peak_values
     folded_data[:, 2, :] /= peak_values
 
-    potential_interp = torch.linspace(0, 1, duration, device=folded_data.device)
-    potential_interp = potential_interp.unsqueeze(0).expand(folded_data.shape[0], -1)
-    interpolated1 = Interp1d.apply(folded_data[:, 0, :],
+    # residue can be calculated either by interpolating both arrays onto a fixed set of points,
+    # as in Hu & Sonnerup (2002), or by 
+    # comparing each point to the corresponding interpolated point from the other branch,
+    # as done in Hu et al. 2018.
+    # The second approach seems better for detecting flux ropes because generally the edge of a
+    # flux rope candidate has a steep gradient (large By) compared to the center,
+    # so evenly spaced A values are biased towards the measurements away from the center
+    # and over-use the interpolated values
+    interpolated1 = interp1d(folded_data[:, 0, :],
                                    folded_data[:, 1, :],
-                                   potential_interp)
-    interpolated2 = Interp1d.apply(folded_data[:, 2, :],
+                                   potential)
+    interpolated2 = interp1d(folded_data[:, 2, :],
                                    folded_data[:, 3, :],
-                                   potential_interp)
+                                   potential)
 
     return interpolated2 - interpolated1
 
