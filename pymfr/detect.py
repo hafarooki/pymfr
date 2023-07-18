@@ -180,7 +180,7 @@ def detect_flux_ropes(magnetic_field,
             assert sum(len(x) for x in masks) == len(good_windows)
             
             new_mask = torch.concat(masks, dim=0)
-            window_mask.put_(good_windows, new_mask & window_mask.index_select(0, good_windows))
+            window_mask.scatter(0, good_windows, new_mask & window_mask.index_select(0, good_windows))
 
         # candidate cleanup done at the end of processing all batches with a given window length
         
@@ -476,7 +476,7 @@ def _sliding_vertical_directions(windows, window_frames, window_avg_field, batch
     perpendicular_direction = F.normalize(torch.cross(path_direction, vertical_directions, dim=-1), dim=-1)
     ratio = ((window_avg_field * vertical_directions).sum(dim=-1) / (window_avg_field * perpendicular_direction).sum(dim=-1)).abs()
     too_close = (ratio > 0.1) | (torch.norm(vertical_directions, dim=-1) == 0)  # also too close if norm of vertical direction is 0
-
+    
     too_close_indices = torch.nonzero(too_close).flatten()
 
     for i in range(0, len(too_close_indices), batch_size):
@@ -555,7 +555,7 @@ def _sliding_vertical_directions(windows, window_frames, window_avg_field, batch
         assert min_residue.shape == (n_too_close, n_vertical_trials)
         argmin = min_residue.argmin(dim=-1)
         index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
-        vertical_directions.put_(too_close_batch_indices.unsqueeze(1).expand(-1, 3), possible_vertical_directions.gather(-2, index).squeeze(-2))
+        vertical_directions.scatter_(0, too_close_batch_indices.unsqueeze(1).expand(-1, 3), possible_vertical_directions.gather(-2, index).squeeze(-2))
     return vertical_directions
 
 
