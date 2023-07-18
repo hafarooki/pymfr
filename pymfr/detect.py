@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 import tqdm as tqdm
 import math
 from functools import partial
+from torchinterp1d import Interp1d
 
 from pymfr.residue import _calculate_residue_diff, _calculate_residue_fit, _calculate_folding_differences
 
@@ -106,16 +107,31 @@ def detect_flux_ropes(magnetic_field,
 
     sliding_windows = _get_sliding_windows(window_lengths, window_steps)
 
-    for nominal_window_length, window_step in (sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
+    for nominal_window_length, nominal_window_step in (sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
         scaled_tensor = full_tensor
-        downsample_factor = 1 if max_processing_resolution is None else max(nominal_window_length // max_processing_resolution, 1) 
-        window_length = nominal_window_length // downsample_factor
+        scaled_overlaps = contains_existing.to(float).unsqueeze(0)
+        downsample_factor = 1 if max_processing_resolution is None else max(nominal_window_length / max_processing_resolution, 1) 
         if downsample_factor > 1:
-            scaled_tensor = F.avg_pool1d(full_tensor.T, downsample_factor, downsample_factor).T
-            window_step = max(1, window_step // downsample_factor)
+            # first, bring within a factor of 2 to max_processing_resolution
+            scaled_tensor = F.avg_pool1d(full_tensor.T, math.floor(downsample_factor), math.floor(downsample_factor)).T
+
+            # still the following factor above max processing resolution
+            remaining_factor = (nominal_window_length / math.floor(downsample_factor)) / max_processing_resolution
+
+            # interpolate to bring to max_processing_resolution
+            scaled_tensor = F.interpolate(scaled_tensor.T.unsqueeze(0), scale_factor=1/remaining_factor, mode="linear", align_corners=True).squeeze(0).T
+         
+            # do the same for overlap flags, except maxpool instead of avgpool so that none of the points that are scaled down overlap
+            scaled_overlaps = F.max_pool1d(scaled_overlaps, math.floor(downsample_factor), math.floor(downsample_factor))
+          
+            # interpolate so that if there is one neighboring that is positive, the interpolated value will be greater than 1
+            scaled_overlaps = F.interpolate(scaled_overlaps.unsqueeze(0), scale_factor=1/remaining_factor, mode="linear", align_corners=True).squeeze(0)
+        
+        window_length = nominal_window_length if max_processing_resolution is None else min(nominal_window_length, max_processing_resolution)
+        window_step = max(1, math.floor(nominal_window_step / downsample_factor))
 
         window_avg_field_strength = F.avg_pool1d(torch.norm(scaled_tensor[:, :3], dim=1).unsqueeze(0), window_length, window_step).squeeze(0)
-        window_overlaps = F.max_pool1d(F.max_pool1d(contains_existing.to(float).unsqueeze(0), downsample_factor, downsample_factor), window_length, window_step).squeeze(0) > 0
+        window_overlaps = F.max_pool1d(scaled_overlaps, window_length, window_step).squeeze(0) > 0
             
         # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
         window_data = scaled_tensor.unfold(size=window_length, step=window_step, dimension=0)
@@ -132,58 +148,11 @@ def detect_flux_ropes(magnetic_field,
                                                                   n_trial_axes,
                                                                   axis_optimizer)
 
-        window_starts = torch.arange(len(window_data), device=scaled_tensor.device) * window_step * downsample_factor
-
-        window_mask = (window_avg_field_strength >= min_strength) & ~window_overlaps
+        window_starts = (torch.arange(len(window_data), device=scaled_tensor.device) * window_step * downsample_factor).to(int)
         
-        batch_outputs = []
-
-        batch_functions = [
-            partial(_get_inflection_point_mask,
-                    window_vertical_directions=window_vertical_directions),
-            partial(_get_frame_quality_mask,
-                    threshold_frame_quality=threshold_frame_quality,
-                    window_frames=window_frames),
-            partial(_get_alfvenicity_mask,
-                    threshold_walen=threshold_walen,
-                    threshold_flow_field_alignment=threshold_flow_field_alignment,
-                    window_frames=window_frames),
-            partial(_find_axes,
-                    threshold_diff=threshold_diff,
-                    n_axis_iterations=n_axis_iterations,
-                    n_trial_axes=n_trial_axes,
-                    min_positive_axial_component=min_positive_axial_component,
-                    axis_optimizer=axis_optimizer,
-                    window_vertical_directions=window_vertical_directions,
-                    batch_outputs=batch_outputs)
-        ]
-
-        for function in batch_functions:
-
-            good_windows = torch.nonzero(window_mask).flatten()
-            
-            masks = []
-
-            dataset = SlidingWindowDataset(window_data, good_windows, batch_size)
-            dataloader = DataLoader(dataset, num_workers=0)
-
-            for i_batch, batch_data in enumerate(dataloader):
-                batch_data = batch_data[0]  # batch dimension is taken care of by dataset instead of dataloader
-                batch_indices = good_windows[i_batch * batch_size:(i_batch + 1) * batch_size]
-
-                if len(batch_indices) == 0:
-                    continue
-
-                assert len(batch_indices) == len(batch_data), f"{len(batch_indices)} vs {len(batch_data)}"
-            
-                masks.append(function(batch_indices=batch_indices, batch_data=batch_data))
-            assert sum(len(x) for x in masks) == len(good_windows)
-            
-            new_mask = torch.concat(masks, dim=0)
-            window_mask.scatter_(0, good_windows, new_mask & window_mask.index_select(0, good_windows))
+        batch_outputs = _batch_process(batch_size, min_strength, threshold_frame_quality, threshold_diff, threshold_walen, threshold_flow_field_alignment, n_axis_iterations, n_trial_axes, min_positive_axial_component, axis_optimizer, window_avg_field_strength, window_overlaps, window_data, window_frames, window_vertical_directions)
 
         # candidate cleanup done at the end of processing all batches with a given window length
-        
         event_candidates = _process_candidates(threshold_fit,
                            nominal_window_length,
                            window_data,
@@ -213,6 +182,55 @@ def detect_flux_ropes(magnetic_field,
     df["end"] = df["end"].astype(int)
     df["duration"] = df["duration"].astype(int)
     return df
+
+def _batch_process(batch_size, min_strength, threshold_frame_quality, threshold_diff, threshold_walen, threshold_flow_field_alignment, n_axis_iterations, n_trial_axes, min_positive_axial_component, axis_optimizer, window_avg_field_strength, window_overlaps, window_data, window_frames, window_vertical_directions):
+    batch_outputs = []
+      
+    window_mask = (window_avg_field_strength >= min_strength) & ~window_overlaps
+
+    batch_functions = [
+            partial(_get_inflection_point_mask,
+                    window_vertical_directions=window_vertical_directions),
+            partial(_get_frame_quality_mask,
+                    threshold_frame_quality=threshold_frame_quality,
+                    window_frames=window_frames),
+            partial(_get_alfvenicity_mask,
+                    threshold_walen=threshold_walen,
+                    threshold_flow_field_alignment=threshold_flow_field_alignment,
+                    window_frames=window_frames),
+            partial(_find_axes,
+                    threshold_diff=threshold_diff,
+                    n_axis_iterations=n_axis_iterations,
+                    n_trial_axes=n_trial_axes,
+                    min_positive_axial_component=min_positive_axial_component,
+                    axis_optimizer=axis_optimizer,
+                    window_vertical_directions=window_vertical_directions,
+                    batch_outputs=batch_outputs)
+        ]
+
+    for function in batch_functions:
+        good_windows = torch.nonzero(window_mask).flatten()
+            
+        masks = []
+
+        dataset = SlidingWindowDataset(window_data, good_windows, batch_size)
+        dataloader = DataLoader(dataset, num_workers=0)
+
+        for i_batch, batch_data in enumerate(dataloader):
+            batch_data = batch_data[0]  # batch dimension is taken care of by dataset instead of dataloader
+            batch_indices = good_windows[i_batch * batch_size:(i_batch + 1) * batch_size]
+
+            if len(batch_indices) == 0:
+                continue
+
+            assert len(batch_indices) == len(batch_data), f"{len(batch_indices)} vs {len(batch_data)}"
+            
+            masks.append(function(batch_indices=batch_indices, batch_data=batch_data))
+        assert sum(len(x) for x in masks) == len(good_windows)
+            
+        new_mask = torch.concat(masks, dim=0)
+        window_mask.scatter_(0, good_windows, new_mask & window_mask.index_select(0, good_windows))
+    return batch_outputs
 
 def _find_axes(batch_data,
                 batch_indices,
