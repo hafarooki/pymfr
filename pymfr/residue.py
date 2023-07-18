@@ -3,10 +3,11 @@ from torchinterp1d import Interp1d
 import numpy as np
 
 
-def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
-    assert len(inflection_points.shape) == 1
+def _calculate_folding_differences(potential, quantity):
     assert len(potential.shape) == 2
-    assert len(field_line_invariant.shape) == 2
+    assert len(quantity.shape) == 2
+
+    inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
 
     if len(inflection_points) == 0:
         return torch.empty((0,), device=inflection_points.device, dtype=torch.float32)
@@ -14,8 +15,8 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
     # force to be positive at peak
     potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
 
-    # second dim is potential1, field_line_invariant1, potential2, field_line_invariant2
-    folded_data = torch.concat((potential.unsqueeze(1), field_line_invariant.unsqueeze(1)), dim=1).repeat(1, 2, 1)
+    # second dim is potential1, quantity1, potential2, quantity2
+    folded_data = torch.concat((potential.unsqueeze(1), quantity.unsqueeze(1)), dim=1).repeat(1, 2, 1)
     duration = folded_data.shape[2]
 
     all_indices = torch.arange(duration, device=inflection_points.device)
@@ -42,11 +43,6 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
     folded_data[:, 3, :] = folded_data[:, 3, :].gather(1, sort2)
 
     # scale x axis from 0 to 1
-    minimum_values = torch.clamp(folded_data[:, 2, :].amin(dim=1, keepdim=True), min=0)
-    unclipped_mask = potential >= minimum_values
-
-    folded_data[:, 0, :] -= minimum_values
-    folded_data[:, 2, :] -= minimum_values
     peak_values = folded_data[:, 2, :].amax(dim=-1, keepdim=True)
     folded_data[:, 0, :] /= peak_values
     folded_data[:, 2, :] /= peak_values
@@ -59,10 +55,21 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
     interpolated2 = Interp1d.apply(folded_data[:, 2, :],
                                    folded_data[:, 3, :],
                                    potential_interp)
-    interp_diff = (interpolated1 - interpolated2) ** 2
 
-    field_line_invariant_clipped = torch.where(unclipped_mask, field_line_invariant, field_line_invariant.mean(dim=1, keepdim=True))
-    min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant_clipped, dim=1)
+    return interpolated2 - interpolated1
+
+
+def _calculate_residue_diff(potential, field_line_invariant):
+    assert len(potential.shape) == 2
+    assert len(field_line_invariant.shape) == 2
+
+    # because aminmax requires non empty tensor
+    if len(potential) == 0:
+        return torch.empty(0, device=potential.device, dtype=potential.dtype)
+    
+    interp_diff = _calculate_folding_differences(potential, field_line_invariant) ** 2
+
+    min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant, dim=1)
     field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
     error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / field_line_invariant_range
 
@@ -72,17 +79,18 @@ def _calculate_residue_diff(inflection_points, potential, field_line_invariant):
     return error_diff
 
 
-def _calculate_residue_fit(potential_array,
-                           transverse_field_line_invariant):
-    min_field_line_invariant, max_field_line_invariant = torch.aminmax(transverse_field_line_invariant)
+def _calculate_residue_fit(potential, transverse_field_line_invariant):
+    min_field_line_invariant, max_field_line_invariant = torch.aminmax(transverse_field_line_invariant, dim=-1)
     field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
 
-    potential_array = potential_array.cpu().numpy()
-    transverse_field_line_invariant = transverse_field_line_invariant.cpu().numpy()
+    x = torch.zeros((*potential.shape, 4), device=potential.device, dtype=potential.dtype)
+    for i in range(4):
+        x[:, :, i] = potential ** i
 
-    coeffs = np.polyfit(x=potential_array, y=transverse_field_line_invariant, deg=3)
-    field_line_invariant_fit = np.poly1d(coeffs)(potential_array)
-    rmse = np.sqrt(np.mean((transverse_field_line_invariant - field_line_invariant_fit) ** 2))
+    # lstsq on gpu appears to be rather buggy
+    coeffs = torch.linalg.lstsq(x.cpu(), transverse_field_line_invariant.cpu().unsqueeze(-1)).solution.to(x.device)
+    field_line_invariant_fit = (x @ coeffs).squeeze(-1)
+    rmse = torch.sqrt(torch.mean((transverse_field_line_invariant - field_line_invariant_fit) ** 2, dim=-1))
     error_fit = rmse / field_line_invariant_range
-
+    # THIS CODE IS BROKEN ;-;
     return error_fit
