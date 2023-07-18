@@ -180,7 +180,7 @@ def detect_flux_ropes(magnetic_field,
             assert sum(len(x) for x in masks) == len(good_windows)
             
             new_mask = torch.concat(masks, dim=0)
-            window_mask.scatter(0, good_windows, new_mask & window_mask.index_select(0, good_windows))
+            window_mask.scatter_(0, good_windows, new_mask & window_mask.index_select(0, good_windows))
 
         # candidate cleanup done at the end of processing all batches with a given window length
         
@@ -382,10 +382,9 @@ def _sliding_frames(tensor, duration, window_step, frame_type):
     dependent_values = F.avg_pool1d(dependent_values.T, duration, window_step).T
 
     try:
-        frames = torch.linalg.solve(coefficient_matrix, dependent_values)
+        frames = torch.linalg.lstsq(coefficient_matrix, dependent_values).solution
     except Exception:
-        # sometimes it is not well determined, but we want some solution anyway (if it is garbage the event will be discarded by the quality threshold)
-        # lstsq appears to be buggy on GPU so do it on CPU
+        # lstsq appears to be buggy on GPU so do it on CPU if it fails
         frames = torch.linalg.lstsq(coefficient_matrix.cpu(), dependent_values.cpu()).solution.to(tensor.device)
     
     return frames
@@ -489,7 +488,7 @@ def _sliding_vertical_directions(windows, window_frames, window_avg_field, batch
         # basis vectors will be the ones with the lowest component value in too_close_path_direction,
         # effectively the one with the lowest dot product and thus most perpendicular
         basis_vectors = torch.zeros_like(too_close_path_directions)
-        basis_vectors = basis_vectors.scatter(dim=1, index=too_close_path_directions.abs().argmin(dim=-1, keepdim=True), value=1)
+        basis_vectors.scatter_(dim=1, index=too_close_path_directions.abs().argmin(dim=-1, keepdim=True), value=1)
 
         # guaranteed perpendicular to too_close_path_directions and nonzero as long as velocity is nonzero
         arbitrary_perpendicular_directions = F.normalize(torch.cross(basis_vectors, too_close_path_directions, dim=-1), dim=-1)
