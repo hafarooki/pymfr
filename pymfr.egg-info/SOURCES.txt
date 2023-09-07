@@ -1,7 +1,6 @@
 LICENSE.md
 README.md
 setup.py
-pymfr/axis.py
 pymfr/detect.py
 pymfr/frame.py
 pymfr/reconstruct.py
