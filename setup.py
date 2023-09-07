@@ -17,5 +17,5 @@ setup(
                       "scipy",
                       "tqdm",
                       "xarray",
-                      "torchinterp1d @ git+https://github.com/aliutkus/torchinterp1d.git"]
+                      "git+https://github.com/aliutkus/torchinterp1d.git"]
 )

@@ -56,11 +56,11 @@ def _calculate_interpolated_values(potential, quantity):
     # so evenly spaced A values are biased towards the measurements away from the center
     # and over-use the interpolated values
     interpolated1 = interp1d(folded_data[:, 0, :],
-                                   folded_data[:, 1, :],
-                                   potential)
+                             folded_data[:, 1, :],
+                             potential)
     interpolated2 = interp1d(folded_data[:, 2, :],
-                                   folded_data[:, 3, :],
-                                   potential)
+                             folded_data[:, 3, :],
+                             potential)
     return interpolated1, interpolated2
 
 
@@ -77,7 +77,7 @@ def _calculate_residue_diff(potential, field_line_invariant):
     # because aminmax requires non empty tensor
     if len(potential) == 0:
         return torch.empty(0, device=potential.device, dtype=potential.dtype)
-    
+
     interp_diff = _calculate_folding_differences(potential, field_line_invariant)
 
     min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant, dim=1)
