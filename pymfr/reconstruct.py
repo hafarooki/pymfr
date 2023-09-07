@@ -224,22 +224,19 @@ def _reconstruct_map(magnetic_field_observed,
                                      + magnetic_field_observed[..., 2] ** 2 / 2)
 
     potential_peak = magnetic_potential_observed.gather(-1, torch.abs(magnetic_potential_observed).argmax(dim=-1,
-                                                                                                          keepdim=True)).squeeze(
-        -1)
+                                                                                                          keepdim=True)).squeeze(-1)
     peak_sign = torch.sign(potential_peak)
 
     field_line_quantity_coeffs = _polyfit(magnetic_potential_observed, field_line_quantity_observed, poly_order)
 
     field_line_quantity_fit = _evaluate_fit_values(field_line_quantity_coeffs, magnetic_potential_observed, peak_sign)
-    field_line_quantity_fit_min, field_line_quantity_fit_max = torch.aminmax(field_line_quantity_fit, dim=-1)
+    field_line_quantity_fit_min, field_line_quantity_fit_max = torch.aminmax(field_line_quantity_observed, dim=-1)
     error_fit = torch.sqrt(torch.mean((field_line_quantity_observed - field_line_quantity_fit) ** 2, dim=-1))
     error_fit = error_fit / (field_line_quantity_fit_max - field_line_quantity_fit_min)
 
     # require derivative to be positive at tail
     error_fit = torch.where(torch.sign(-field_line_quantity_coeffs[..., 1]) == peak_sign.squeeze(-1), error_fit,
                             torch.inf)
-
-    # error_fit = error_fit / torch.abs(field_line_quantity_observed.mean(dim=-1))
 
     d2_dx2 = _second_derivative
     second_derivative_x = d2_dx2(magnetic_potential_observed)

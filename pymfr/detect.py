@@ -200,12 +200,15 @@ def _batch_process(batch_size,
             batch_output = function(batch_indices=batch_indices, batch_data=batch_data)
             if type(batch_output) != tuple:
                 batch_output = (batch_output,)
-            else:
+            elif not dense:
                 batch_mask = batch_output[0]
+
                 batch_output = (batch_mask, *[x[batch_mask] for x in batch_output[1:]])
+
             batch_outputs.append(batch_output)
 
         combined_output = [torch.concat(x, dim=0) for x in zip(*batch_outputs)]
+        # print(len(good_windows), dense, combined_output, batch_outputs)
         new_mask = combined_output[0]
         assert len(new_mask) == len(good_windows)
 
@@ -213,19 +216,22 @@ def _batch_process(batch_size,
 
         if len(combined_output) > 1:
             combined_output = combined_output[1:]
-            new_good_windows = torch.nonzero(window_mask).flatten()
 
             if not dense:
+                new_good_windows = torch.nonzero(window_mask).flatten()
                 combined_output = tuple(
                     (torch.sparse_coo_tensor(new_good_windows.unsqueeze(0), x, (len(window_mask), *x.shape[1:]))
                      for x in combined_output))
             else:
                 combined_output = tuple(
-                    ((torch.zeros((len(window_mask),) + x.shape[1:], device=x.device, dtype=x.dtype) * torch.nan) \
-                    .scatter(0, new_good_windows.reshape((-1, *([1] * (len(x.shape) - 1)))).expand(-1, *x.shape[1:]), x)
+                    ((torch.empty((len(window_mask),) + x.shape[1:], device=x.device, dtype=x.dtype)) \
+                    .scatter(0, good_windows.reshape((-1, *([1] * (len(x.shape) - 1)))).expand(-1, *x.shape[1:]), x)
                      for x in combined_output))
 
             return combined_output[0] if len(combined_output) == 1 else combined_output
+
+    if ~torch.any(window_mask):
+        return None
 
     execute_batched(partial(_get_inflection_point_mask,
                             window_vertical_directions=window_vertical_directions))
@@ -253,6 +259,8 @@ def _batch_process(batch_size,
     if ~torch.any(window_mask):
         return None
 
+
+
     window_map_Az, window_map_Bx, window_map_By, window_map_Bz, \
         window_map_Jx, window_map_Jy, window_map_Jz, \
         window_map_core_mask, window_error_fit = execute_batched(partial(_validate_map,
@@ -265,15 +273,7 @@ def _batch_process(batch_size,
                                                                          threshold_fit=threshold_fit), dense=False)
     window_error_fit = window_error_fit.to_dense()
 
-    good_indices = torch.nonzero(window_mask).flatten()
-    for i in good_indices[torch.argsort(window_error_diff.index_select(0, good_indices), descending=False)]:
-        start = window_starts[i]
-
-        if torch.any(contains_existing[start:start + nominal_window_length]):
-            window_mask[i] = False
-            continue
-
-        contains_existing[start:start + nominal_window_length] = True
+    remove_overlaps(contains_existing, nominal_window_length, window_error_diff, window_mask, window_starts)
 
     if ~torch.any(window_mask):
         return None
@@ -317,6 +317,21 @@ def _batch_process(batch_size,
     return dataset
 
 
+# @torch.jit.script
+def remove_overlaps(contains_existing, nominal_window_length, window_error_diff, window_mask, window_starts):
+    # sorted_indices = torch.argsort(window_starts, descending=False)
+
+    good_indices = torch.nonzero(window_mask).flatten()
+    for i in good_indices[torch.argsort(window_error_diff.index_select(0, good_indices), descending=False)]:
+        start = window_starts[i]
+
+        if torch.any(contains_existing[start:start + nominal_window_length]):
+            window_mask[i] = False
+            continue
+
+        contains_existing[start:start + nominal_window_length] = True
+
+
 def _pack_data(magnetic_field, velocity, density, gas_pressure):
     # all arrays must have the same number of samples
     n_sample = len(magnetic_field)
@@ -355,10 +370,11 @@ def _pack_data(magnetic_field, velocity, density, gas_pressure):
     return tensor
 
 
+
 def _find_axes(batch_data,
+               batch_indices,
                threshold_walen_slope,
                threshold_flow_field_alignment,
-               batch_indices,
                threshold_diff,
                n_trial_axes,
                window_frames,
@@ -399,9 +415,11 @@ def _find_axes(batch_data,
     axis_residue = _calculate_residue_diff(batch_normalized_potential, axial_component)
     error_diff = _calculate_residue_diff(batch_normalized_potential, transverse_pressure)
 
-    # combine all the masks
-    mask = walen_slope_mask & (axis_residue <= threshold_diff) & (error_diff <= threshold_diff)
+    # eliminate events where the transverse pressure tends to decrease
+    overall_sign = torch.sign(torch.mean(transverse_pressure * batch_normalized_potential, dim=-1) / torch.mean(batch_normalized_potential ** 2, dim=-1))
 
+    # combine all the masks
+    mask = walen_slope_mask & (axis_residue <= threshold_diff) & (error_diff <= threshold_diff) & (overall_sign == 1)
     return mask, batch_axes, error_diff, walen_slope, flow_field_alignment
 
 
@@ -461,8 +479,6 @@ def _validate_map(batch_indices,
     mask_fit = reconstructed_map.error_fit <= threshold_fit
 
     y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
-
-    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
 
     sign = torch.sign(reconstructed_map.magnetic_potential[:, y_observed, :].mean(dim=1))
 
