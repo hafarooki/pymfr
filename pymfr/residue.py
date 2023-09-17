@@ -3,7 +3,7 @@ from torchinterp1d import interp1d
 import numpy as np
 
 
-def _calculate_folding_differences(potential, quantity):
+def _calculate_interpolated_values(potential, quantity):
     assert len(potential.shape) == 2
     assert len(quantity.shape) == 2
 
@@ -61,6 +61,11 @@ def _calculate_folding_differences(potential, quantity):
     interpolated2 = interp1d(folded_data[:, 2, :],
                                    folded_data[:, 3, :],
                                    potential)
+    return interpolated1, interpolated2
+
+
+def _calculate_folding_differences(potential, quantity):
+    interpolated1, interpolated2 = _calculate_interpolated_values(potential, quantity)
 
     return interpolated2 - interpolated1
 
@@ -73,30 +78,14 @@ def _calculate_residue_diff(potential, field_line_invariant):
     if len(potential) == 0:
         return torch.empty(0, device=potential.device, dtype=potential.dtype)
     
-    interp_diff = _calculate_folding_differences(potential, field_line_invariant) ** 2
+    interp_diff = _calculate_folding_differences(potential, field_line_invariant)
 
     min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant, dim=1)
     field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
-    error_diff = torch.sqrt(torch.mean(interp_diff, dim=1) / 2) / field_line_invariant_range
+    # error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1)) / field_line_invariant_range
+    error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1)) / field_line_invariant_range
 
     # infinity if 0 field_line_invariant range
     error_diff = torch.where(field_line_invariant_range > 0, error_diff, torch.inf)
 
     return error_diff
-
-
-def _calculate_residue_fit(potential, transverse_field_line_invariant):
-    min_field_line_invariant, max_field_line_invariant = torch.aminmax(transverse_field_line_invariant, dim=-1)
-    field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
-
-    x = torch.zeros((*potential.shape, 4), device=potential.device, dtype=potential.dtype)
-    for i in range(4):
-        x[:, :, i] = potential ** i
-
-    # lstsq on gpu appears to be rather buggy
-    coeffs = torch.linalg.lstsq(x.cpu(), transverse_field_line_invariant.cpu().unsqueeze(-1)).solution.to(x.device)
-    field_line_invariant_fit = (x @ coeffs).squeeze(-1)
-    rmse = torch.sqrt(torch.mean((transverse_field_line_invariant - field_line_invariant_fit) ** 2, dim=-1))
-    error_fit = rmse / field_line_invariant_range
-    # THIS CODE IS BROKEN ;-;
-    return error_fit

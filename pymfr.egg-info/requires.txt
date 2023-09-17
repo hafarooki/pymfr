@@ -1,5 +1,5 @@
+torch
 numpy
 scipy
-torch>=1.8.2
-torchinterp1d@ git+https://github.com/aliutkus/torchinterp1d.git
 tqdm
+torchinterp1d@ git+https://github.com/aliutkus/torchinterp1d.git

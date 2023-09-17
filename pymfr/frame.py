@@ -43,14 +43,14 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
     # even though it works fine if applied individually
     inverse_matrix = torch.linalg.pinv(coefficient_matrix, hermitian=True)
     dependent_values = torch.cross(electric_field, magnetic_field, dim=-1).mean(dim=-2)
-    fitting_result = (inverse_matrix @ dependent_values.unsqueeze(2)).squeeze(2)
+    fitting_result = (inverse_matrix @ dependent_values.unsqueeze(-1)).squeeze(-1)
 
     if not estimate_uncertainty:
         return fitting_result
 
     remaining_electric_field = electric_field + torch.cross(fitting_result.unsqueeze(-2), magnetic_field, dim=-1)
     dependent_values = torch.cross(remaining_electric_field, magnetic_field, dim=-1).mean(dim=-2)
-    uncertainty = (inverse_matrix @ dependent_values.unsqueeze(2)).squeeze(2)
+    uncertainty = (inverse_matrix @ dependent_values.unsqueeze(-1)).squeeze(-1)
 
     return fitting_result, uncertainty
 
