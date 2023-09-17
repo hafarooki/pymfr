@@ -322,4 +322,17 @@ def _reconstruct_map(magnetic_field_observed,
                             gas_pressure,
                             core_mask)
 
+    # from assumption of 2D magnetic field (\partial/\partial z = 0):
+    # \mu_0 j_x = {\partial B_z}/{\partial y}
+    # \mu_0 j_y = {-\partial B_z}{\partial x}
+    # \mu_0 j_z = -\del^2 A_z
+    current_density_unit = (1e-9) / (
+                scipy.constants.mu_0 * pixel_width[..., None, None])  # mA/m^2 if B is in nT and pixel width in km
+    current_density_x = torch.gradient(magnetic_field_z, dim=-2, edge_order=1)[0] * current_density_unit
+    current_density_y = torch.gradient(magnetic_field_z, dim=-1, edge_order=1)[0] * current_density_unit
+    current_density_z = -(_laplacian(output_map.flatten(-2),
+                                     potential_peak,
+                                     poly_order,
+                                     field_line_quantity_coeffs).reshape(output_map.shape) * scale_factor[
+                              ..., None, None]) * current_density_unit
 

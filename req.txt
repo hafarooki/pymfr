@@ -4,5 +4,5 @@ jupyter
 numpy==1.23.1
 pandas==1.4.3
 torch
-xarray==2023.7.0
+xarray
 git+https://github.com/aliutkus/torchinterp1d

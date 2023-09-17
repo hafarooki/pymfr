@@ -76,7 +76,8 @@ def detect_flux_ropes(magnetic_field,
 
     sliding_windows = _get_sliding_windows(window_lengths, window_steps)
 
-    for nominal_window_length, nominal_window_step in (sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
+    for nominal_window_length, nominal_window_step in (
+    sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
         scaled_tensor = full_tensor
         scaled_overlaps = contains_existing.to(float).unsqueeze(0)
         downsample_factor = 1 if max_processing_resolution is None else max(nominal_window_length / max_processing_resolution, 1)
@@ -99,7 +100,8 @@ def detect_flux_ropes(magnetic_field,
         window_length = nominal_window_length if max_processing_resolution is None else min(nominal_window_length, max_processing_resolution)
         window_step = max(1, math.floor(nominal_window_step / downsample_factor))
 
-        window_avg_field_strength = F.avg_pool1d(torch.norm(scaled_tensor[:, :3], dim=1).unsqueeze(0), window_length, window_step).squeeze(0)
+        window_avg_field_strength = F.avg_pool1d(torch.norm(scaled_tensor[:, :3], dim=1).unsqueeze(0), window_length,
+                                                 window_step).squeeze(0)
         window_overlaps = F.max_pool1d(scaled_overlaps, window_length, window_step).squeeze(0) > 0
 
         # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
@@ -172,7 +174,6 @@ def _batch_process(batch_size,
                    window_starts,
                    window_vertical_directions,
                    contains_existing):
-
     window_mask = ~window_overlaps
 
     def execute_batched(function, dense=True):

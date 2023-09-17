@@ -7,45 +7,36 @@ def _calculate_interpolated_values(potential, quantity):
     assert len(potential.shape) == 2
     assert len(quantity.shape) == 2
 
+    if len(potential) == 0:
+        return torch.empty((0,), device=potential.device, dtype=torch.float32)
+
     inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
 
-    if len(inflection_points) == 0:
-        return torch.empty((0,), device=inflection_points.device, dtype=torch.float32)
+    # fix peak at 1
+    potential = potential / potential.gather(-1, inflection_points.unsqueeze(1))
 
-    # force to be positive at peak
-    potential = torch.where(potential.gather(1, inflection_points.unsqueeze(1)) < 0, -potential, potential)
-
-    # second dim is potential1, quantity1, potential2, quantity2
-    folded_data = torch.concat((potential.unsqueeze(1), quantity.unsqueeze(1)), dim=1).repeat(1, 2, 1)
-    duration = folded_data.shape[2]
+    duration = potential.shape[-1]
 
     all_indices = torch.arange(duration, device=inflection_points.device)
-    all_indices = all_indices.unsqueeze(0).expand(folded_data.shape[0], -1)
+    all_indices = all_indices.unsqueeze(0).expand(potential.shape[0], -1)
     before = all_indices < inflection_points.unsqueeze(1)
     after = all_indices > inflection_points.unsqueeze(1)
 
-    indices = torch.arange(len(folded_data), device=folded_data.device)
-    inflection_point_values = folded_data[indices, :2, inflection_points]
-    inflection_point_values = inflection_point_values.unsqueeze(2).expand(-1, -1, duration)
+    inflection_point_quantity = quantity.gather(-1, inflection_points.unsqueeze(1)).squeeze(1)
 
     # in first half, values after inflection point should be the inflection points repeated
-    folded_data[:, :2, :] = torch.where(after.unsqueeze(1), inflection_point_values, folded_data[:, :2, :])
+    potential_left = torch.where(after, 1, potential)
+    quantity_left = torch.where(after, inflection_point_quantity.unsqueeze(1), quantity)
 
     # in second half, values before inflection point should be the inflection points repeated
-    folded_data[:, 2:, :] = torch.where(before.unsqueeze(1), inflection_point_values, folded_data[:, 2:, :])
+    potential_right = torch.where(before, 1, potential)
+    quantity_right = torch.where(before, inflection_point_quantity.unsqueeze(1), quantity)
 
-    sort1 = torch.argsort(folded_data[:, 0, :], dim=1)
-    folded_data[:, 0, :] = folded_data[:, 0, :].gather(1, sort1)
-    folded_data[:, 1, :] = folded_data[:, 1, :].gather(1, sort1)
+    potential_left, argsort_left = torch.sort(potential_left, dim=1)
+    quantity_left = quantity_left.gather(1, argsort_left)
 
-    sort2 = torch.argsort(folded_data[:, 2, :], dim=1)
-    folded_data[:, 2, :] = folded_data[:, 2, :].gather(1, sort2)
-    folded_data[:, 3, :] = folded_data[:, 3, :].gather(1, sort2)
-
-    # scale x axis from ~0 to 1
-    peak_values = folded_data[:, 2, :].amax(dim=-1, keepdim=True)
-    folded_data[:, 0, :] /= peak_values
-    folded_data[:, 2, :] /= peak_values
+    potential_right, argsort_right = torch.sort(potential_right, dim=1)
+    quantity_right = quantity_right.gather(1, argsort_right)
 
     # residue can be calculated either by interpolating both arrays onto a fixed set of points,
     # as in Hu & Sonnerup (2002), or by 
