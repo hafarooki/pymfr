@@ -46,12 +46,8 @@ def _calculate_interpolated_values(potential, quantity):
     # flux rope candidate has a steep gradient (large By) compared to the center,
     # so evenly spaced A values are biased towards the measurements away from the center
     # and over-use the interpolated values
-    interpolated1 = interp1d(folded_data[:, 0, :],
-                                   folded_data[:, 1, :],
-                                   potential)
-    interpolated2 = interp1d(folded_data[:, 2, :],
-                                   folded_data[:, 3, :],
-                                   potential)
+    interpolated1 = interp1d(potential_left, quantity_left, potential)
+    interpolated2 = interp1d(potential_right, quantity_right, potential)
     return interpolated1, interpolated2
 
 

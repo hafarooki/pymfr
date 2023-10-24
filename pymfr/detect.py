@@ -14,6 +14,9 @@ from pymfr.residue import _calculate_residue_diff, _calculate_folding_difference
 from pymfr.reconstruct import reconstruct_map
 
 
+MAP_RESOLUTION = 11
+
+
 def detect_flux_ropes(magnetic_field,
                       velocity,
                       density,
@@ -76,9 +79,11 @@ def detect_flux_ropes(magnetic_field,
 
     sliding_windows = _get_sliding_windows(window_lengths, window_steps)
 
-    for nominal_window_length, nominal_window_step in (
-    sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
+    for nominal_window_length, nominal_window_step in (sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)):
         scaled_tensor = full_tensor
+
+        smooth_angles = _calculate_smooth_angles(full_tensor, nominal_window_length)
+
         scaled_overlaps = contains_existing.to(float).unsqueeze(0)
         downsample_factor = 1 if max_processing_resolution is None else max(nominal_window_length / max_processing_resolution, 1)
         if downsample_factor > 1:
@@ -90,6 +95,10 @@ def detect_flux_ropes(magnetic_field,
 
             # interpolate to bring window length down to max_processing_resolution
             scaled_tensor = F.interpolate(scaled_tensor.T.unsqueeze(0), scale_factor=1/remaining_factor, mode="linear", align_corners=True).squeeze(0).T
+
+            # do the same for smooth angles
+            smooth_angles = F.avg_pool1d(smooth_angles.reshape(1, -1), math.floor(downsample_factor), math.floor(downsample_factor)).reshape(-1)
+            smooth_angles = F.interpolate(smooth_angles.reshape(1, 1, -1), scale_factor=1/remaining_factor, mode="linear", align_corners=True).reshape(-1)
 
             # do the same for overlap flags, except maxpool instead of avgpool so that none of the points that are scaled down overlap
             scaled_overlaps = F.max_pool1d(scaled_overlaps, math.floor(downsample_factor), math.floor(downsample_factor))
@@ -116,6 +125,8 @@ def detect_flux_ropes(magnetic_field,
                                                                   window_avg_field_strength,
                                                                   batch_size,
                                                                   n_trial_axes)
+        
+        window_smoothness = F.avg_pool1d(smooth_angles.unsqueeze(0), window_length, window_step).squeeze(0)
 
         output = _batch_process(batch_size,
                                        nominal_window_length,
@@ -131,7 +142,9 @@ def detect_flux_ropes(magnetic_field,
                                        window_frames,
                                        window_starts,
                                        window_vertical_directions,
-                                       contains_existing)
+                                       full_tensor,
+                                       contains_existing,
+                                       window_smoothness)
         
         if output is None:
             continue
@@ -142,6 +155,24 @@ def detect_flux_ropes(magnetic_field,
         return None
 
     return xarray.concat(output_datasets, dim="event")
+
+
+def _calculate_smooth_angles(tensor, window_length):
+    magnetic_field = tensor[..., :3]   
+    
+    kernel_size = max(window_length // 10, 1)
+    
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # simple moving average
+    smoothed = F.avg_pool1d(magnetic_field.T,
+                            kernel_size=kernel_size,
+                            padding=kernel_size // 2,
+                            count_include_pad=False,
+                            stride=1).T
+
+    return (F.normalize(smoothed, dim=1) * F.normalize(magnetic_field)).sum(dim=1)
 
 
 class SlidingWindowDataset(torch.utils.data.Dataset):
@@ -173,8 +204,10 @@ def _batch_process(batch_size,
                    window_frames,
                    window_starts,
                    window_vertical_directions,
-                   contains_existing):
-    window_mask = ~window_overlaps
+                   full_tensor,
+                   contains_existing,
+                   window_smoothness):
+    window_mask = (~window_overlaps) & (window_smoothness >= 0.95)
 
     def execute_batched(function, dense=True):
         good_windows = torch.nonzero(window_mask).flatten()
@@ -263,7 +296,7 @@ def _batch_process(batch_size,
     window_error_fit = window_error_fit.to_dense()
 
     good_indices = torch.nonzero(window_mask).flatten()
-    for i in good_indices[torch.argsort(window_error_fit.index_select(0, good_indices), descending=False)]:
+    for i in good_indices[torch.argsort(window_error_diff.index_select(0, good_indices), descending=False)]:
         start = window_starts[i]
 
         if torch.any(contains_existing[start:start + nominal_window_length]):
@@ -357,11 +390,10 @@ def _find_axes(batch_data,
 
     batch_normalized_potential = _calculate_normalized_potential(batch_magnetic_field, batch_vertical_directions)
 
-    batch_axes = _minimize_axis_residue(batch_magnetic_field,
+    batch_axes, axis_residue = _minimize_axis_residue(batch_magnetic_field,
                                                 batch_vertical_directions,
                                                 batch_normalized_potential,
-                                                n_trial_axes,
-                                                return_residue=False)
+                                                n_trial_axes)
 
     axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
 
@@ -387,9 +419,8 @@ def _find_axes(batch_data,
                                                          batch_gas_pressure,
                                                          alpha)
 
-
-    axis_residue = _calculate_residue_diff(batch_normalized_potential, axial_component)
     error_diff = _calculate_residue_diff(batch_normalized_potential, transverse_pressure)
+    density_diff = _calculate_residue_diff(batch_normalized_potential, batch_density)
     pressure_fluctuation = transverse_pressure - transverse_pressure.mean(dim=-1, keepdims=True)
     potential_fluctuation = batch_normalized_potential - batch_normalized_potential.mean(dim=-1, keepdims=True)
     transverse_pressure_sign = torch.sign((pressure_fluctuation * potential_fluctuation).sum(dim=-1) / (potential_fluctuation ** 2).sum(dim=-1))
@@ -504,10 +535,8 @@ def _generate_map(data,
     y_axis = F.normalize(torch.cross(axes, x_axis, dim=-1), dim=-1)
     basis = torch.stack([x_axis, y_axis, axes], dim=-1)
 
-    resolution = 11
-
     reconstructed_map = reconstruct_map(batch_magnetic_field @ basis, batch_gas_pressure, alpha=alpha,
-                                            sample_spacing=dx, poly_order=2, resolution=resolution)
+                                            sample_spacing=dx, poly_order=2, resolution=MAP_RESOLUTION)
                                             
     return reconstructed_map
 
@@ -515,6 +544,7 @@ def _generate_map(data,
 def _sliding_frames(tensor, window_length, window_step):
     magnetic_field = tensor[..., :3]
     velocity = tensor[..., 3:6]
+
     electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
 
     Bx, By, Bz = magnetic_field[..., 0], magnetic_field[..., 1], magnetic_field[..., 2]
@@ -536,6 +566,7 @@ def _sliding_frames(tensor, window_length, window_step):
         frames = torch.linalg.lstsq(coefficient_matrix.cpu(), dependent_values.cpu()).solution.to(tensor.device)
 
     return frames
+
 
 
 def _calculate_frame_quality(frames, magnetic_field, velocity, electric_field):
@@ -571,8 +602,6 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, potential, n_tri
     index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
     optimal_axes = trial_axes.gather(-2, index).squeeze(-2)
 
-    # residue = torch.where(residue * 2 < error_diff_axis.amax(dim=-1), residue, torch.inf)
-
     if return_residue:
         return optimal_axes, residue
     else:
@@ -590,7 +619,6 @@ def _calculate_residue_map(magnetic_field, trial_axes, potential):
     error_diff = torch.mean(differences ** 2, dim=1) ** .5 / axial_range
 
     return error_diff
-
 
 def _sliding_vertical_directions(scaled_tensor, window_length, window_step, windows, window_frames, window_avg_field_strength, batch_size, n_trial_axes):
     # use conv1d kernel to perform trapezoid integration
@@ -707,19 +735,13 @@ def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
     # simple linear regression slope with y intercept fixed at 0
     walen_slope = (remaining_flow.flatten(1) * alfven_velocity.flatten(1)).sum(dim=1) / (alfven_velocity.flatten(1) ** 2).sum(dim=1)
 
-    # this is equivalent to pearson correlation except forcing y intercept to be 0
-    field_alignment = (F.normalize(remaining_flow.flatten(1), dim=1) * F.normalize(alfven_velocity.flatten(1), dim=1)).sum(dim=1)
+    field_alignment = (F.normalize(remaining_flow.flatten(1) - remaining_flow.flatten(1).mean(dim=1, keepdim=True), dim=1) *\
+                        F.normalize(alfven_velocity.flatten(1) - alfven_velocity.flatten(1).mean(dim=1, keepdim=True), dim=1)).sum(dim=1)
 
     return walen_slope, field_alignment
 
 
 def _count_inflection_points(magnetic_field, vertical_directions):
-    # stricter smoothing than the original algorithm,
-    # because this implementation relies more heavily on having only a single inflection point
-    # since it does no trimming of the window size.
-    # based on my testing, doing this does not drastically reduce the number of quality flux ropes
-    # but it does greatly increase the quality of the flux ropes that are detected - H. Farooki
-
     magnetic_field_y = (magnetic_field * vertical_directions.unsqueeze(dim=-2)).sum(dim=-1)
 
     kernel_size = max(magnetic_field_y.shape[-1] // 10, 1)
