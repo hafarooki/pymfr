@@ -35,7 +35,7 @@ class ReconstructedMap():
 
 
 def reconstruct_map(magnetic_field_observed, gas_pressure_observed, sample_spacing, alpha=None,
-                              resolution = 21, poly_order: int = 3, aspect_ratio: float = 1):
+                              resolution: int = 21, pad: int = 0, poly_order: int = 3, aspect_ratio: float = 1):
     magnetic_field_observed = torch.as_tensor(magnetic_field_observed)
     dtype = magnetic_field_observed.dtype
     device = magnetic_field_observed.device
@@ -50,6 +50,7 @@ def reconstruct_map(magnetic_field_observed, gas_pressure_observed, sample_spaci
                                             sample_spacing,
                                             alpha,
                                             resolution,
+                                            pad,
                                             poly_order,
                                             aspect_ratio)
 
@@ -169,30 +170,40 @@ def _reconstruct_map(magnetic_field_observed,
                                pixel_width,
                                alpha,
                                resolution: int = 21,
+                               pad: int = 0,
                                poly_order: int = 3,
                                aspect_ratio: float = 1):
     original_resolution = magnetic_field_observed.shape[-2]
+    inner_resolution = resolution - pad * 2
+
+    min_Bz = torch.amin(magnetic_field_observed[..., 2], dim=-1)
 
     magnetic_potential_observed = torch.zeros_like(magnetic_field_observed[..., 1])
-    magnetic_potential_observed[..., 1:] = torch.cumulative_trapezoid(-magnetic_field_observed[..., 1], dx=resolution / original_resolution)
+    magnetic_potential_observed[..., 1:] = torch.cumulative_trapezoid(-magnetic_field_observed[..., 1], dx=inner_resolution / original_resolution)
 
-    if resolution < original_resolution:
+    if inner_resolution < original_resolution:
         magnetic_field_observed = F.adaptive_avg_pool1d(magnetic_field_observed.reshape(-1, original_resolution, 3).transpose(-1, -2),
-                                            resolution).transpose(-1, -2).reshape(magnetic_field_observed.shape[:-2] + (resolution, 3))
+                                            inner_resolution).transpose(-1, -2).reshape(magnetic_field_observed.shape[:-2] + (inner_resolution, 3))
         gas_pressure_observed = F.adaptive_avg_pool1d(gas_pressure_observed.reshape(-1, 1, original_resolution),
-                                            resolution).reshape(gas_pressure_observed.shape[:-1] + (resolution,))
+                                            inner_resolution).reshape(gas_pressure_observed.shape[:-1] + (inner_resolution,))
         magnetic_potential_observed = F.adaptive_avg_pool1d(magnetic_potential_observed.reshape(-1, 1, original_resolution),
-                                            resolution).reshape(magnetic_potential_observed.shape[:-1] + (resolution,))
-    elif resolution > original_resolution:        
+                                            inner_resolution).reshape(magnetic_potential_observed.shape[:-1] + (inner_resolution,))
+    elif inner_resolution > original_resolution:        
         magnetic_field_observed = F.interpolate(magnetic_field_observed.reshape(-1, original_resolution, 3).transpose(-1, -2),
-                                                resolution, mode="linear", align_corners=True
-                                                ).transpose(-1, -2).reshape(magnetic_field_observed.shape[:-2] + (resolution, 3))
+                                                inner_resolution, mode="linear", align_corners=True
+                                                ).transpose(-1, -2).reshape(magnetic_field_observed.shape[:-2] + (inner_resolution, 3))
         gas_pressure_observed = F.interpolate(gas_pressure_observed.reshape(-1, 1, original_resolution),
-                                            resolution, mode="linear", align_corners=True
-                                            ).reshape(gas_pressure_observed.shape[:-1] + (resolution,))
+                                            inner_resolution, mode="linear", align_corners=True
+                                            ).reshape(gas_pressure_observed.shape[:-1] + (inner_resolution,))
         magnetic_potential_observed = F.interpolate(magnetic_potential_observed.reshape(-1, 1, original_resolution),
-                                            resolution, mode="linear", align_corners=True
-                                            ).reshape(magnetic_potential_observed.shape[:-1] + (resolution,))
+                                            inner_resolution, mode="linear", align_corners=True
+                                            ).reshape(magnetic_potential_observed.shape[:-1] + (inner_resolution,))
+
+    magnetic_potential_observed = F.pad(magnetic_potential_observed, (pad, pad), mode="constant", value=0)
+    gas_pressure_observed = F.pad(gas_pressure_observed, (pad, pad), mode="constant", value=gas_pressure_observed.min())
+    magnetic_field_observed = F.pad(magnetic_field_observed, (0, 0, pad, pad), mode="constant", value=0)
+    magnetic_field_observed[..., 2] = torch.maximum(magnetic_field_observed[..., 2], min_Bz.unsqueeze(-1))
+
     """
     # smooth
     filter_length = max(1, original_resolution // 10)
@@ -232,6 +243,9 @@ def _reconstruct_map(magnetic_field_observed,
                                     + magnetic_field_observed[..., 2] ** 2 / 2)
     
     peak_sign = torch.sign(magnetic_potential_observed.mean(dim=-1))
+
+    magnetic_field_z_fit = _polyfit(magnetic_potential_observed, magnetic_field_observed[..., 2], poly_order)
+    gas_pressure_fit = _polyfit(magnetic_potential_observed, gas_pressure_observed, poly_order)
 
     field_line_quantity_coeffs = _polyfit(magnetic_potential_observed, field_line_quantity_observed, poly_order)
 
@@ -273,7 +287,7 @@ def _reconstruct_map(magnetic_field_observed,
         second_derivative_y = second_derivative_y_observed
 
         for i in torch.arange(1, extrapolation_length * extra_steps + 1, device=potential.device):            
-            height = i / (extrapolation_length * extra_steps)
+            height = torch.clip(i / (extrapolation_length * extra_steps) * (resolution / inner_resolution), max=0.7)
 
             potential = _three_point_smooth(potential + first_derivative_y * dy + (1 / 2) * second_derivative_y * (dy ** 2), height)
 
@@ -291,9 +305,7 @@ def _reconstruct_map(magnetic_field_observed,
     magnetic_potential = output_map * pixel_width[..., None, None] * (original_resolution / resolution) * scale_factor[..., None, None]
     magnetic_field_x = torch.gradient(output_map, dim=-2, edge_order=1)[0] * scale_factor[..., None, None]
     magnetic_field_y = -torch.gradient(output_map, dim=-1, edge_order=1)[0] * scale_factor[..., None, None]
-    magnetic_field_z_fit = _polyfit(magnetic_potential_observed, magnetic_field_observed[..., 2], poly_order)
     magnetic_field_z = _evaluate_fit_values(magnetic_field_z_fit, output_map.flatten(-2), peak_sign).reshape(output_map.shape) * scale_factor[..., None, None]
-    gas_pressure_fit = _polyfit(magnetic_potential_observed, gas_pressure_observed, poly_order)
     gas_pressure = _evaluate_fit_values(gas_pressure_fit, output_map.flatten(-2), peak_sign).reshape(output_map.shape) * scale_factor[..., None, None]
 
     # from assumption of 2D magnetic field (\partial/\partial z = 0):

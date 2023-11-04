@@ -142,7 +142,6 @@ def detect_flux_ropes(magnetic_field,
                                        window_frames,
                                        window_starts,
                                        window_vertical_directions,
-                                       full_tensor,
                                        contains_existing,
                                        window_smoothness)
         
@@ -204,7 +203,6 @@ def _batch_process(batch_size,
                    window_frames,
                    window_starts,
                    window_vertical_directions,
-                   full_tensor,
                    contains_existing,
                    window_smoothness):
     window_mask = (~window_overlaps) & (window_smoothness >= 0.95)
@@ -420,13 +418,14 @@ def _find_axes(batch_data,
                                                          alpha)
 
     error_diff = _calculate_residue_diff(batch_normalized_potential, transverse_pressure)
-    density_diff = _calculate_residue_diff(batch_normalized_potential, batch_density)
+    Bz_fluctuation = axial_component - axial_component.mean(dim=-1, keepdims=True)
     pressure_fluctuation = transverse_pressure - transverse_pressure.mean(dim=-1, keepdims=True)
     potential_fluctuation = batch_normalized_potential - batch_normalized_potential.mean(dim=-1, keepdims=True)
+    Bz_sign = torch.sign((Bz_fluctuation * potential_fluctuation).sum(dim=-1) / (potential_fluctuation ** 2).sum(dim=-1))
     transverse_pressure_sign = torch.sign((pressure_fluctuation * potential_fluctuation).sum(dim=-1) / (potential_fluctuation ** 2).sum(dim=-1))
 
     # combine all the masks
-    mask = walen_slope_mask & (axis_residue <= threshold_diff) & (error_diff <= threshold_diff) & (transverse_pressure_sign == 1)
+    mask = walen_slope_mask & (axis_residue <= threshold_diff) & (error_diff <= threshold_diff) & (transverse_pressure_sign == 1) & (Bz_sign == 1)
 
     return mask, batch_axes, error_diff, walen_slope, flow_field_alignment
 
@@ -448,9 +447,7 @@ def _get_inflection_point_mask(batch_data, batch_indices, window_vertical_direct
     batch_vertical_directions = window_vertical_directions.index_select(0, batch_indices)
     batch_magnetic_field = batch_data[:, :, :3]
 
-
-    return _count_inflection_points(batch_magnetic_field, batch_vertical_directions) == 1
-
+    return _is_good_vertical_component(batch_magnetic_field, batch_vertical_directions)
 
 def _get_frame_quality_mask(batch_data, batch_indices, threshold_frame_quality, window_frames):
     batch_frames = window_frames.index_select(0, batch_indices)
@@ -491,23 +488,29 @@ def _validate_map(batch_indices,
     sign = torch.sign(reconstructed_map.magnetic_potential[:, y_observed, :].mean(dim=1))
 
     mask_fit = (reconstructed_map.error_fit <= threshold_fit)
+    reconstructed_map
 
     closed_values = torch.abs(torch.where(reconstructed_map.core_mask, reconstructed_map.magnetic_potential * sign[:, None, None], torch.nan))
     peak_closed = torch.nan_to_num(closed_values, -torch.inf).flatten(-2).max(dim=-1)
     peak_observed_value = torch.nan_to_num(closed_values, -torch.inf)[:, y_observed, :].amax(dim=-1)
     minimum_closed = torch.nan_to_num(closed_values, torch.inf).flatten(-2).min(dim=-1)
-    minimum_observed_value = torch.nan_to_num(closed_values, torch.inf).flatten(-2).amin(dim=-1)
 
     height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
     width = torch.any(reconstructed_map.core_mask, dim=-2).to(float).sum(dim=-1)
 
-    mask_current = reconstructed_map.current_density_z.flatten(-2).gather(-1, peak_closed.indices.unsqueeze(-1)).squeeze(-1) * sign > reconstructed_map.current_density_z.flatten(-2).gather(-1, minimum_closed.indices.unsqueeze(-1)).squeeze(-1) * sign
+    closed_current_values = torch.abs(torch.where(reconstructed_map.core_mask, reconstructed_map.current_density_z * sign[:, None, None], torch.nan))
+    current_at_peak = closed_current_values.flatten(-2).gather(-1, peak_closed.indices.unsqueeze(-1)).squeeze(-1)
+    current_at_minimum = closed_current_values.flatten(-2).gather(-1, minimum_closed.indices.unsqueeze(-1)).squeeze(-1)
+    minimum_current = torch.nan_to_num(closed_current_values, torch.inf).flatten(-2).amin(dim=-1)
+    maximum_current = torch.nan_to_num(closed_current_values, -torch.inf).flatten(-2).amax(dim=-1)
 
-    mask_closed = (width > 4) & (height > 4) & (minimum_closed.values < peak_observed_value) & mask_current
+    mask_current = (current_at_minimum <= minimum_current) & (current_at_peak >= maximum_current)
+
+    mask_closed = (width >= 5) & (height >= 5) & (minimum_closed.values <= peak_observed_value)
 
     mask_valid = ~torch.any((torch.isnan(reconstructed_map.magnetic_potential) | torch.isinf(reconstructed_map.magnetic_potential)).flatten(-2), dim=-1)
 
-    return mask_fit & mask_closed & mask_valid,\
+    return mask_fit & mask_valid & mask_current & mask_closed,\
         reconstructed_map.magnetic_potential, reconstructed_map.magnetic_field_x, reconstructed_map.magnetic_field_y, reconstructed_map.magnetic_field_z,\
         reconstructed_map.current_density_x, reconstructed_map.current_density_y, reconstructed_map.current_density_z,\
         reconstructed_map.core_mask, reconstructed_map.error_fit
@@ -535,8 +538,14 @@ def _generate_map(data,
     y_axis = F.normalize(torch.cross(axes, x_axis, dim=-1), dim=-1)
     basis = torch.stack([x_axis, y_axis, axes], dim=-1)
 
-    reconstructed_map = reconstruct_map(batch_magnetic_field @ basis, batch_gas_pressure, alpha=alpha,
-                                            sample_spacing=dx, poly_order=2, resolution=MAP_RESOLUTION)
+    input_B = batch_magnetic_field @ basis
+
+
+    reconstructed_map = reconstruct_map(input_B, batch_gas_pressure, alpha=alpha,
+                                            sample_spacing=dx,
+                                            poly_order=3,
+                                            resolution=MAP_RESOLUTION,
+                                            pad=0)
                                             
     return reconstructed_map
 
@@ -601,7 +610,7 @@ def _minimize_axis_residue(magnetic_field, vertical_directions, potential, n_tri
     residue, argmin = error_diff_axis.min(dim=-1)
     index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
     optimal_axes = trial_axes.gather(-2, index).squeeze(-2)
-
+    
     if return_residue:
         return optimal_axes, residue
     else:
@@ -693,7 +702,7 @@ def _sliding_vertical_directions(scaled_tensor, window_length, window_step, wind
 
             axis_batch_potential = _calculate_normalized_potential(axis_batch_field,
                                                                    axis_batch_directions)
-            axis_batch_inflection_mask = (_count_inflection_points(axis_batch_field, axis_batch_directions) == 1) & (torch.abs(axis_batch_potential[..., -1]) < torch.abs(axis_batch_potential).amax(dim=-1) * .1)
+            axis_batch_inflection_mask = (_is_good_vertical_component(axis_batch_field, axis_batch_directions)) & (torch.abs(axis_batch_potential[..., -1]) < torch.abs(axis_batch_potential).amax(dim=-1) * .1)
 
             axis_batch_min_residue = torch.ones(len(axis_batch_directions),
                                                 dtype=axis_batch_directions.dtype,
@@ -741,7 +750,7 @@ def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
     return walen_slope, field_alignment
 
 
-def _count_inflection_points(magnetic_field, vertical_directions):
+def _is_good_vertical_component(magnetic_field, vertical_directions):
     magnetic_field_y = (magnetic_field * vertical_directions.unsqueeze(dim=-2)).sum(dim=-1)
 
     kernel_size = max(magnetic_field_y.shape[-1] // 10, 1)
@@ -758,7 +767,9 @@ def _count_inflection_points(magnetic_field, vertical_directions):
 
     is_sign_change = (torch.diff(torch.sign(smoothed)) != 0).to(int)
 
-    return torch.sum(is_sign_change, dim=-1)
+    single_stationary_point = torch.sum(is_sign_change, dim=-1) == 1
+
+    return single_stationary_point
 
 
 def _calculate_normalized_potential(magnetic_field, vertical_directions):
