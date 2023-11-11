@@ -1,5 +1,5 @@
 import torch
-from torchinterp1d import interp1d
+from pymfr.torchinterp1d import interp1d
 import numpy as np
 
 

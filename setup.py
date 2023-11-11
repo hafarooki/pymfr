@@ -7,7 +7,7 @@ except ImportError:
 
 setup(
     name="pymfr",
-    version="2.0.0",
+    version="2.1.0",
     author="Hameedullah A. Farooki",
     author_email="haf5@njit.edu",
     packages=["pymfr"],
@@ -16,6 +16,5 @@ setup(
                       "numpy",
                       "scipy",
                       "tqdm",
-                      "xarray",
-                      "torchinterp1d @ git+https://github.com/aliutkus/torchinterp1d.git"]
+                      "xarray"]
 )

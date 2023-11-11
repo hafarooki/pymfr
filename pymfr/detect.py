@@ -6,7 +6,7 @@ import torch.utils.data
 import tqdm as tqdm
 import math
 from functools import partial
-from torchinterp1d import interp1d
+from pymfr.torchinterp1d import interp1d
 from xarray import Dataset
 import xarray
 
@@ -143,7 +143,8 @@ def detect_flux_ropes(magnetic_field,
                                        window_starts,
                                        window_vertical_directions,
                                        contains_existing,
-                                       window_smoothness)
+                                       window_smoothness,
+                                       full_tensor)
         
         if output is None:
             continue
@@ -204,8 +205,9 @@ def _batch_process(batch_size,
                    window_starts,
                    window_vertical_directions,
                    contains_existing,
-                   window_smoothness):
-    window_mask = (~window_overlaps) & (window_smoothness >= 0.95)
+                   window_smoothness,
+                   full_tensor):
+    window_mask = (~window_overlaps) & (window_smoothness >= 0.98)
 
     def execute_batched(function, dense=True):
         good_windows = torch.nonzero(window_mask).flatten()
@@ -289,7 +291,6 @@ def _batch_process(batch_size,
                     window_walen_slope=window_walen_slope,
                     nominal_window_length=nominal_window_length,
                     sample_spacing=sample_spacing,
-                    threshold_walen_slope=threshold_walen_slope,
                     threshold_fit=threshold_fit), dense=False)
     window_error_fit = window_error_fit.to_dense()
 
@@ -300,6 +301,16 @@ def _batch_process(batch_size,
         if torch.any(contains_existing[start:start + nominal_window_length]):
             window_mask[i] = False
             continue
+
+        # full_window_data = full_tensor[window_starts[i]:window_starts[i] + nominal_window_length]
+        
+        # reference_B = full_window_data[:, :3]
+        # x_axis = F.normalize(-(window_frames[i] - (window_frames[i] * window_axes[i]).sum(dim=-1, keepdim=True) * window_axes[i]), dim=-1)
+        # y_axis = F.normalize(torch.cross(window_axes[i], x_axis, dim=-1), dim=-1)
+        # basis = torch.stack([x_axis, y_axis, window_axes[i]], dim=-1)
+        # reference_B = reference_B @ basis
+        # model_B = torch.column_stack([component[i][MAP_RESOLUTION // 2, :] for component in [window_map_Bx, window_map_By, window_map_Bz]])
+        # interpolated_B = F.interpolate(model_B.T.unsqueeze(0), nominal_window_length, mode="linear", align_corners=True).squeeze(0).T
 
         contains_existing[start:start + nominal_window_length] = True
 
@@ -466,7 +477,6 @@ def _validate_map(batch_indices,
                             window_walen_slope,
                             nominal_window_length,
                             sample_spacing,
-                            threshold_walen_slope,
                             threshold_fit):
     batch_axes = window_axes.index_select(0, batch_indices)
     batch_frames = window_frames.index_select(0, batch_indices)
@@ -477,9 +487,7 @@ def _validate_map(batch_indices,
                                           batch_frames,
                                           batch_walen_slope,
                                           nominal_window_length,
-                                          sample_spacing,
-                                          threshold_walen_slope)
-
+                                          sample_spacing)
 
     y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
 
@@ -521,8 +529,7 @@ def _generate_map(data,
                           frames,
                           walen_slope,
                           nominal_window_length,
-                          sample_spacing,
-                          threshold_walen_slope):
+                          sample_spacing):
     batch_magnetic_field = data[:, :, :3]
     batch_gas_pressure = data[:, :, 7]
 
@@ -539,7 +546,6 @@ def _generate_map(data,
     basis = torch.stack([x_axis, y_axis, axes], dim=-1)
 
     input_B = batch_magnetic_field @ basis
-
 
     reconstructed_map = reconstruct_map(input_B, batch_gas_pressure, alpha=alpha,
                                             sample_spacing=dx,
