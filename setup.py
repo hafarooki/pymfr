@@ -1,10 +1,5 @@
 from setuptools import setup
 
-try:
-    import torch
-except ImportError:
-    raise Exception("pymfr requires PyTorch")
-
 setup(
     name="pymfr",
     version="2.1.0",
