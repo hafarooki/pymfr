@@ -254,9 +254,6 @@ def _reconstruct_map(magnetic_field_observed,
     error_fit = torch.sqrt(torch.mean((field_line_quantity_observed - field_line_quantity_fit) ** 2, dim=-1))
     error_fit = error_fit / (field_line_quantity_fit_max - field_line_quantity_fit_min)
 
-    # require derivative to be positive at tail
-    error_fit = torch.where(torch.sign(-field_line_quantity_coeffs[..., 1]) == peak_sign.squeeze(-1), error_fit, torch.inf)
-
     d2_dx2 = _second_derivative
     second_derivative_x = d2_dx2(magnetic_potential_observed)
 
