@@ -334,6 +334,8 @@ def _batch_process(
                         new_good_windows.unsqueeze(0),
                         x,
                         (len(window_mask), *x.shape[1:]),
+                        check_invariants=False,
+                        is_coalesced=True,
                     )
                     for x in combined_output
                 )

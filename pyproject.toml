@@ -29,4 +29,5 @@ dev = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "pandas>=2.3.3",
+    "pytest>=9.1.1",
 ]
