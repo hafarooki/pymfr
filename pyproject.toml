@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pymfr"
+version = "3.0.0"
+description = "Open-source tools for analyzing time-series data of magnetic flux ropes (MFRs)"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Hameedullah A. Farooki", email = "hafarooki@princeton.edu" }]
+keywords = ["pymfr", "fluxrope", "mfr", "smfr", "grad-shafranov", "gs"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "tqdm",
+    "xarray",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pymfr"]
