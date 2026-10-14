@@ -1,9 +1,11 @@
 import torch
 
 
-def estimate_ht_frame(magnetic_field: torch.tensor,
-                      electric_field: torch.tensor,
-                      estimate_uncertainty=False):
+def estimate_ht_frame(
+    magnetic_field: torch.tensor,
+    electric_field: torch.tensor,
+    estimate_uncertainty=False,
+):
     """
     Estimate the DeHoffman-Teller (HT) frame based on magnetic field and electric field data such that
     the electric field in such a frame is zero.
@@ -28,11 +30,16 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
 
     Bx, By, Bz = magnetic_field[..., 0], magnetic_field[..., 1], magnetic_field[..., 2]
 
-    coefficients = [[By ** 2 + Bz ** 2, -Bx * By, -Bx * Bz],
-                    [-Bx * By, Bx ** 2 + Bz ** 2, -By * Bz],
-                    [-Bx * Bz, -By * Bz, Bx ** 2 + By ** 2]]
-    coefficient_matrix = torch.zeros((*magnetic_field.shape[:-2], 3, 3), device=magnetic_field.device,
-                                     dtype=magnetic_field.dtype)
+    coefficients = [
+        [By**2 + Bz**2, -Bx * By, -Bx * Bz],
+        [-Bx * By, Bx**2 + Bz**2, -By * Bz],
+        [-Bx * Bz, -By * Bz, Bx**2 + By**2],
+    ]
+    coefficient_matrix = torch.zeros(
+        (*magnetic_field.shape[:-2], 3, 3),
+        device=magnetic_field.device,
+        dtype=magnetic_field.dtype,
+    )
     for i in range(3):
         for j in range(3):
             coefficient_matrix[..., i, j] = coefficients[i][j].mean(dim=-1)
@@ -48,16 +55,20 @@ def estimate_ht_frame(magnetic_field: torch.tensor,
     if not estimate_uncertainty:
         return fitting_result
 
-    remaining_electric_field = electric_field + torch.cross(fitting_result.unsqueeze(-2), magnetic_field, dim=-1)
-    dependent_values = torch.cross(remaining_electric_field, magnetic_field, dim=-1).mean(dim=-2)
+    remaining_electric_field = electric_field + torch.cross(
+        fitting_result.unsqueeze(-2), magnetic_field, dim=-1
+    )
+    dependent_values = torch.cross(
+        remaining_electric_field, magnetic_field, dim=-1
+    ).mean(dim=-2)
     uncertainty = (inverse_matrix @ dependent_values.unsqueeze(-1)).squeeze(-1)
 
     return fitting_result, uncertainty
 
 
-def estimate_ht2d_frame(magnetic_field: torch.tensor,
-                        electric_field: torch.tensor,
-                        axes: torch.tensor):
+def estimate_ht2d_frame(
+    magnetic_field: torch.tensor, electric_field: torch.tensor, axes: torch.tensor
+):
     """
     Find the frame where the electric field along the axis is zero.
     Assumes that the covariance matrix of the magnetic field
@@ -96,7 +107,9 @@ def estimate_ht2d_frame(magnetic_field: torch.tensor,
 
     if multiple_axes:
         # add extra dimension after batch dimensions for axes
-        solutions = solutions.unsqueeze(-3).expand(*((-1,) * (len(axes.shape) - 2)), axes.shape[-2], -1, -1)
+        solutions = solutions.unsqueeze(-3).expand(
+            *((-1,) * (len(axes.shape) - 2)), axes.shape[-2], -1, -1
+        )
 
     frames = torch.cross(axes, (solutions @ axes.unsqueeze(-1)).squeeze(-1), dim=-1)
     return frames
@@ -109,7 +122,9 @@ def _covariance(a, b):
 
     d_a = a - a.mean(dim=-2, keepdim=True)
     d_b = b - b.mean(dim=-2, keepdim=True)
-    matrix = torch.zeros((*a.shape[:-2], a.shape[-1], a.shape[-1]), device=a.device, dtype=a.dtype)
+    matrix = torch.zeros(
+        (*a.shape[:-2], a.shape[-1], a.shape[-1]), device=a.device, dtype=a.dtype
+    )
     for i in range(3):
         for j in range(3):
             matrix[..., i, j] = (d_a[..., i] * d_b[..., j]).mean(dim=-1)

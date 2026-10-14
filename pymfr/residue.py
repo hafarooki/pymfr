@@ -1,6 +1,6 @@
 import torch
+
 from pymfr.torchinterp1d import interp1d
-import numpy as np
 
 
 def _calculate_interpolated_values(potential, quantity):
@@ -22,7 +22,9 @@ def _calculate_interpolated_values(potential, quantity):
     before = all_indices < inflection_points.unsqueeze(1)
     after = all_indices > inflection_points.unsqueeze(1)
 
-    inflection_point_quantity = quantity.gather(-1, inflection_points.unsqueeze(1)).squeeze(1)
+    inflection_point_quantity = quantity.gather(
+        -1, inflection_points.unsqueeze(1)
+    ).squeeze(1)
 
     # in first half, values after inflection point should be the inflection points repeated
     potential_left = torch.where(after, 1, potential)
@@ -30,7 +32,9 @@ def _calculate_interpolated_values(potential, quantity):
 
     # in second half, values before inflection point should be the inflection points repeated
     potential_right = torch.where(before, 1, potential)
-    quantity_right = torch.where(before, inflection_point_quantity.unsqueeze(1), quantity)
+    quantity_right = torch.where(
+        before, inflection_point_quantity.unsqueeze(1), quantity
+    )
 
     potential_left, argsort_left = torch.sort(potential_left, dim=1)
     quantity_left = quantity_left.gather(1, argsort_left)
@@ -39,7 +43,7 @@ def _calculate_interpolated_values(potential, quantity):
     quantity_right = quantity_right.gather(1, argsort_right)
 
     # residue can be calculated either by interpolating both arrays onto a fixed set of points,
-    # as in Hu & Sonnerup (2002), or by 
+    # as in Hu & Sonnerup (2002), or by
     # comparing each point to the corresponding interpolated point from the other branch,
     # as done in Hu et al. 2018.
     # The second approach seems better for detecting flux ropes because generally the edge of a
@@ -64,13 +68,17 @@ def _calculate_residue_diff(potential, field_line_invariant):
     # because aminmax requires non empty tensor
     if len(potential) == 0:
         return torch.empty(0, device=potential.device, dtype=potential.dtype)
-    
+
     interp_diff = _calculate_folding_differences(potential, field_line_invariant)
 
-    min_field_line_invariant, max_field_line_invariant = torch.aminmax(field_line_invariant, dim=1)
+    min_field_line_invariant, max_field_line_invariant = torch.aminmax(
+        field_line_invariant, dim=1
+    )
     field_line_invariant_range = max_field_line_invariant - min_field_line_invariant
     # error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1)) / field_line_invariant_range
-    error_diff = torch.sqrt(torch.mean(interp_diff ** 2, dim=1)) / field_line_invariant_range
+    error_diff = (
+        torch.sqrt(torch.mean(interp_diff**2, dim=1)) / field_line_invariant_range
+    )
 
     # infinity if 0 field_line_invariant range
     error_diff = torch.where(field_line_invariant_range > 0, error_diff, torch.inf)
