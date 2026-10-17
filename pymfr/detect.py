@@ -2,12 +2,13 @@ import math
 from functools import partial
 
 import numpy as np
+import pandera.xarray as pa
 import torch
 import torch.nn.functional as F
 import torch.utils.data
 import tqdm
 import xarray
-from xarray import Dataset
+from pandera.typing.xarray import Dataset
 
 from pymfr.reconstruct import reconstruct_map
 from pymfr.residue import (
@@ -18,6 +19,33 @@ from pymfr.residue import (
 MAP_RESOLUTION = 11
 
 
+class DetectedFluxRopes(pa.DatasetModel):
+    window_start: np.int64 = pa.Field(dims=("event",))
+    window_length: np.int64 = pa.Field(dims=("event",))
+    temporal_scale: np.float32 = pa.Field(dims=("event",))
+    spatial_scale: np.float32 = pa.Field(dims=("event",))
+    residue_diff: np.float32 = pa.Field(dims=("event",))
+    residue_fit: np.float32 = pa.Field(dims=("event",))
+    walen_slope: np.float32 = pa.Field(dims=("event",))
+    frame_quality: np.float32 = pa.Field(dims=("event",))
+    flow_field_alignment: np.float32 = pa.Field(dims=("event",))
+    axis_x: np.float32 = pa.Field(dims=("event",))
+    axis_y: np.float32 = pa.Field(dims=("event",))
+    axis_z: np.float32 = pa.Field(dims=("event",))
+    velocity_x: np.float32 = pa.Field(dims=("event",))
+    velocity_y: np.float32 = pa.Field(dims=("event",))
+    velocity_z: np.float32 = pa.Field(dims=("event",))
+    map_Az: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_Bx: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_By: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_Bz: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_Jx: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_Jy: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_Jz: np.float32 = pa.Field(dims=("event", "y", "x"))
+    map_core_mask: bool = pa.Field(dims=("event", "y", "x"))
+
+
+@pa.check_types
 def detect_flux_ropes(
     magnetic_field,
     velocity,
@@ -36,7 +64,7 @@ def detect_flux_ropes(
     max_processing_resolution=None,
     cuda=None,
     progress_bar=True,
-):
+) -> Dataset[DetectedFluxRopes]:
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
 
@@ -65,7 +93,7 @@ def detect_flux_ropes(
     Odd number is desirable so that one of the trial axes includes the previous iteration's best orientation (starting with avg field direction).
     :param max_processing_resolution: Scale sliding window data down to approximately this size (if larger) before generating sliding windows to reduce memory usage.
     :param cuda: Whether to use the GPU. Default None uses the GPU only if available.
-    :return: A DataFrame describing the detected flux ropes.
+    :return: A ``DetectedFluxRopes`` dataset describing the detected flux ropes (empty along ``event`` if none were found).
     """
 
     full_tensor = _pack_data(magnetic_field, velocity, density, gas_pressure)
@@ -222,7 +250,18 @@ def detect_flux_ropes(
         output_datasets.append(output)
 
     if len(output_datasets) == 0:
-        return None
+        return xarray.Dataset(
+            data_vars={
+                name: (
+                    field.dims,
+                    np.zeros(
+                        (0,) + (MAP_RESOLUTION,) * (len(field.dims) - 1),
+                        dtype=field.dtype,
+                    ),
+                )
+                for name, field in DetectedFluxRopes.to_schema().data_vars.items()
+            }
+        )
 
     return xarray.concat(output_datasets, dim="event")
 
@@ -452,7 +491,9 @@ def _batch_process(
         return None
 
     temporal_scale = (
-        torch.ones_like(window_starts) * nominal_window_length * sample_spacing
+        torch.ones_like(window_starts, dtype=torch.float32)
+        * nominal_window_length
+        * sample_spacing
     )
     dx_dt = torch.linalg.norm(
         window_frames
@@ -463,7 +504,7 @@ def _batch_process(
 
     remaining_indices = torch.nonzero(window_mask).flatten()
 
-    dataset = Dataset(
+    dataset = xarray.Dataset(
         data_vars={
             "window_start": (["event"], window_starts[remaining_indices].cpu().numpy()),
             "window_length": (
