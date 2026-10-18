@@ -413,20 +413,12 @@ def _batch_process(
                 )
             else:
                 combined_output = tuple(
-                    (
-                        torch.zeros(
-                            (len(window_mask),) + x.shape[1:],
-                            device=x.device,
-                            dtype=x.dtype,
-                        )
-                        * torch.nan
-                    ).scatter(
-                        0,
-                        new_good_windows.reshape(
-                            (-1, *([1] * (len(x.shape) - 1)))
-                        ).expand(-1, *x.shape[1:]),
-                        x,
-                    )
+                    torch.full(
+                        (len(window_mask), *x.shape[1:]),
+                        torch.nan,
+                        device=x.device,
+                        dtype=x.dtype,
+                    ).index_put_((new_good_windows,), x)
                     for x in combined_output
                 )
 
@@ -1028,8 +1020,8 @@ def _calculate_residue_map(magnetic_field, trial_axes, potential):
         dim=-1,
     )
 
-    differences = difference_vectors @ trial_axes.transpose(1, 2)
-    axial = magnetic_field @ trial_axes.transpose(1, 2)
+    differences = torch.einsum("bsc,bkc->bsk", difference_vectors, trial_axes)
+    axial = torch.einsum("btc,bkc->btk", magnetic_field, trial_axes)
 
     min_axial, max_axial = torch.aminmax(axial, dim=1)
     axial_range = max_axial - min_axial
@@ -1160,21 +1152,13 @@ def _sliding_vertical_directions(
 
         minimum_residues = []  # best residue attainable for each vertical axis
 
-        for i_axis_batch in range(0, n_vertical_trials, axis_batch_step):
-            axis_batch_size = (
-                min(i_axis_batch + axis_batch_step, n_vertical_trials) - i_axis_batch
+        for axis_batch_directions in possible_vertical_directions.split(
+            axis_batch_step, dim=1
+        ):
+            # broadcast view pairing each field with each trial direction
+            axis_batch_field = too_close_field.unsqueeze(1).expand(
+                -1, axis_batch_directions.shape[1], -1, -1
             )
-
-            # looks like [B1, B1, B1, B2, B2, B2] if axis_batch_size = 3 and n_too_close=2
-            axis_batch_field = torch.repeat_interleave(
-                too_close_field, axis_batch_size, dim=0
-            )
-
-            # looks like [axis1a, axis1b, axis1c, axis2a, axis2b, axis2c]
-            axis_batch_directions = possible_vertical_directions[
-                :, i_axis_batch : i_axis_batch + axis_batch_size, :
-            ].reshape(-1, 3)
-
             axis_batch_potential = _calculate_normalized_potential(
                 axis_batch_field, axis_batch_directions
             )
@@ -1184,14 +1168,11 @@ def _sliding_vertical_directions(
                 torch.abs(axis_batch_potential[..., -1])
                 < torch.abs(axis_batch_potential).amax(dim=-1) * 0.1
             )
-
-            axis_batch_min_residue = (
-                torch.ones(
-                    len(axis_batch_directions),
-                    dtype=axis_batch_directions.dtype,
-                    device=axis_batch_directions.device,
-                )
-                * torch.inf
+            axis_batch_min_residue = torch.full(
+                axis_batch_inflection_mask.shape,
+                torch.inf,
+                dtype=axis_batch_directions.dtype,
+                device=axis_batch_directions.device,
             )
 
             if torch.any(axis_batch_inflection_mask):
@@ -1204,22 +1185,16 @@ def _sliding_vertical_directions(
                     )[1]
                 )
 
-            # each entry of minimum_residues looks like
-            # [[residue1a, residue1b, residue1c], [residue2a, residue2b, residue2c]]
-            minimum_residues.append(
-                axis_batch_min_residue.reshape(n_too_close, axis_batch_size)
-            )
+            minimum_residues.append(axis_batch_min_residue)
 
         # looks like [[residue1a, ..., residue1z], [residue2a, ..., residue2z]]
         min_residue = torch.concat(minimum_residues, dim=1)
         assert min_residue.shape == (n_too_close, n_vertical_trials)
         argmin = min_residue.argmin(dim=-1)
-        index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
-        vertical_directions.scatter_(
-            0,
-            too_close_batch_indices.unsqueeze(1).expand(-1, 3),
-            possible_vertical_directions.gather(-2, index).squeeze(-2),
-        )
+        best = torch.take_along_dim(
+            possible_vertical_directions, argmin[:, None, None], dim=1
+        ).squeeze(1)
+        vertical_directions[too_close_batch_indices] = best
     return vertical_directions
 
 
@@ -1248,8 +1223,8 @@ def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
 
 
 def _is_good_vertical_component(magnetic_field, vertical_directions):
-    magnetic_field_y = (magnetic_field * vertical_directions.unsqueeze(dim=-2)).sum(
-        dim=-1
+    magnetic_field_y = torch.einsum(
+        "...tc,...c->...t", magnetic_field, vertical_directions
     )
 
     kernel_size = max(magnetic_field_y.shape[-1] // 10, 1)
