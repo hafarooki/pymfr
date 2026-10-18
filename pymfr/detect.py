@@ -1,7 +1,5 @@
 import math
-from collections.abc import Callable
 from functools import partial
-from typing import Self
 
 import numpy as np
 import pandera.xarray as pa
@@ -10,7 +8,7 @@ import torch.nn.functional as F
 import tqdm
 import xarray
 from pandera.typing.xarray import Dataset
-from tensordict import TensorClass
+from tensordict import TensorDict
 
 from pymfr.reconstruct import reconstruct_map
 from pymfr.residue import (
@@ -47,58 +45,6 @@ class DetectedFluxRopes(pa.DatasetModel):
     map_core_mask: bool = pa.Field(dims=("event", "y", "x"))
 
 
-class _InputData(TensorClass):
-    magnetic_field: torch.Tensor
-    velocity: torch.Tensor
-    density: torch.Tensor
-    gas_pressure: torch.Tensor
-
-    def __post_init__(self) -> None:
-        # note that this reruns a lot so this needs to be limited to
-        # things that do not involve a GPU sync
-        assert self.magnetic_field.shape[-1] == 3
-        assert self.velocity.shape == self.magnetic_field.shape
-        assert self.density.shape == self.magnetic_field.shape[:-1]
-        assert self.gas_pressure.shape == self.magnetic_field.shape[:-1]
-
-    def resample_time(self, function: Callable[[torch.Tensor], torch.Tensor]) -> Self:
-        """
-        run a torch 1D operation (e.g., avg_pool1d and interpolate) along the time axis
-        of each field. those operations require input of shape (batch, channel, time)
-        """
-
-        def resample_field(field: torch.Tensor) -> torch.Tensor:
-            n_time = field.shape[0]
-            # (time,) or (time, 3) -> (1, channel, time)
-            channels_first = field.reshape(n_time, -1).T.unsqueeze(0)
-            # (1, channel, time) -> (1, channel, new_time)
-            resampled = function(channels_first)
-            # (1, channel, new_time) -> (new_time, channel)
-            time_first = resampled.squeeze(0).T
-            # -> (new_time,) or (new_time, 3)
-            return time_first.reshape(time_first.shape[0], *field.shape[1:])
-
-        # the new length isn't known before the op runs, so apply it
-        # unbatched and then take the batch size from the first dim
-        return self.apply(resample_field, batch_size=[]).auto_batch_size_(batch_dims=1)
-
-    def sliding_windows(self, size: int, step: int) -> Self:
-        """
-        splits the time axis into overlapping windows without copying:
-        (time, ...) -> (window, size, ...), where window i covers samples
-        i * step to i * step + size
-        """
-        n_window = (self.batch_size[0] - size) // step + 1
-
-        def window_field(field: torch.Tensor) -> torch.Tensor:
-            # unfold puts each window's samples last: (window, ..., size)
-            windows = field.unfold(0, size, step)
-            # move them next to the window axis: (window, size, ...)
-            return windows.movedim(-1, 1)
-
-        return self.apply(window_field, batch_size=[n_window, size])
-
-
 @pa.check_types
 def detect_flux_ropes(
     magnetic_field,
@@ -115,7 +61,7 @@ def detect_flux_ropes(
     threshold_walen_slope=0.3,
     threshold_flow_field_alignment=0.8,
     n_trial_axes=256,
-    max_processing_resolution=None,
+    max_processing_resolution=32,
     cuda=None,
     progress_bar=True,
 ) -> Dataset[DetectedFluxRopes]:
@@ -131,21 +77,22 @@ def detect_flux_ropes(
     :param magnetic_field: Magnetic field vectors in nT, shape (N, 3).
     :param velocity: Proton velocity vectors in km/s, shape (N, 3).
     :param density: Proton number density in cm^-3, shape (N,).
-    :param batch_size_: Number of windows to process per batch.
+    :param gas_pressure: Plasma pressure in nPa, shape (N,).
+    :param batch_size: Number of windows to process per batch.
     :param window_lengths: A range of sliding window sizes.
     :param window_steps: A range of sliding window strides.
     :param sample_spacing: Spacing between samples in seconds.
-    :param threshold_frame_quality: Minimum correlation coefficient for the HT frame (Khabrov and Sonnerup, 1998). Default 0.95
+    :param threshold_frame_quality: Minimum correlation coefficient for the HT frame (Khabrov and Sonnerup, 1998).
     :param threshold_diff: The maximum allowable R_diff
     :param threshold_fit: The maximum allowable R_fit
-    :param threshold_walen_slope: The threshold for <M_A> (calculated using Walen slope) to determine if the remaining flow is significant. Default 0.1.
+    :param threshold_walen_slope: The threshold for <M_A> (calculated using Walen slope) to determine if the remaining flow is significant.
     :param threshold_flow_field_alignment: The threshold for the correlation between v and v_A
     (validates that v is field aligned with constant M_A).
     If flux ropes with field aligned flows are not desired, then set to None.
     Default 0.8.
     :param n_trial_axes: The number of evenly spaced guess orientations used for the axis determination algorithm.
     Odd number is desirable so that one of the trial axes includes the previous iteration's best orientation (starting with avg field direction).
-    :param max_processing_resolution: Scale sliding window data down to approximately this size (if larger) before generating sliding windows to reduce memory usage.
+    :param max_processing_resolution: Scale sliding window data down to approximately this size (if larger) before generating sliding windows to reduce memory usage. Default 32. If None, windows are processed at full resolution.
     :param cuda: Whether to use the GPU. Default None uses the GPU only if available.
     :return: A ``DetectedFluxRopes`` dataset describing the detected flux ropes (empty along ``event`` if none were found).
     """
@@ -154,7 +101,7 @@ def detect_flux_ropes(
         cuda = torch.cuda.is_available()
 
     # convert all arrays to tensor so that numpy arrays can be given
-    data = _InputData(
+    data = TensorDict(
         magnetic_field=magnetic_field,
         velocity=velocity,
         density=density,
@@ -163,17 +110,23 @@ def detect_flux_ropes(
         device="cuda" if cuda else "cpu",
     ).float()  # convert to float32 explicitly also, for consistent behavior regardless of input dtype
 
+    assert data["magnetic_field"].shape[1:] == (3,)
+    assert data["velocity"].shape == data["magnetic_field"].shape
+    assert data["density"].shape == data.batch_size
+    assert data["gas_pressure"].shape == data.batch_size
+
     assert not any(torch.isnan(field).any() for field in data.values()), (
         "Data contains missing values (nan). PyMFR does not automatically handle missing values. Instead, please keep track of which data points contain nans beforehand, interpolate or fill, and then remove flux ropes with intervals containing too many NaNs."
     )
 
-    # these are updated as the algorithm runs
     # contains_existing keeps track of samples that were already confirmed as MFRs
     # for longer window lengths so that shorter windows do not attempt to overwrite them
+    # initialized to all 0
     contains_existing = torch.zeros(
         len(magnetic_field), dtype=torch.bool, device=data.device
     )
 
+    # accumulates across window sizes: one for each window size, then combined
     output_datasets = []
 
     assert len(set(window_lengths)) == len(window_lengths), (
@@ -186,127 +139,20 @@ def detect_flux_ropes(
         sorted(zip(window_lengths, window_steps, strict=True), reverse=True),
         disable=not progress_bar,
     ):
-        scaled_data = data
-
-        smooth_angles = _calculate_smooth_angles(data, nominal_window_length)
-
-        scaled_overlaps = contains_existing.to(float).unsqueeze(0)
-        downsample_factor = (
-            1
-            if max_processing_resolution is None
-            else max(nominal_window_length / max_processing_resolution, 1)
-        )
-        if downsample_factor > 1:
-            # first, bring within a factor of 2 to max_processing_resolution
-            scaled_data = data.resample_time(
-                partial(
-                    F.avg_pool1d,
-                    kernel_size=math.floor(downsample_factor),
-                    stride=math.floor(downsample_factor),
-                )
-            )
-
-            # at this point, the window length is still the following factor above max processing resolution
-            remaining_factor = (
-                nominal_window_length / math.floor(downsample_factor)
-            ) / max_processing_resolution
-
-            # interpolate to bring window length down to max_processing_resolution
-            scaled_data = scaled_data.resample_time(
-                partial(
-                    F.interpolate,
-                    scale_factor=1 / remaining_factor,
-                    mode="linear",
-                    align_corners=True,
-                )
-            )
-
-            # do the same for smooth angles
-            smooth_angles = F.avg_pool1d(
-                smooth_angles.reshape(1, -1),
-                math.floor(downsample_factor),
-                math.floor(downsample_factor),
-            ).reshape(-1)
-            smooth_angles = F.interpolate(
-                smooth_angles.reshape(1, 1, -1),
-                scale_factor=1 / remaining_factor,
-                mode="linear",
-                align_corners=True,
-            ).reshape(-1)
-
-            # do the same for overlap flags, except maxpool instead of avgpool so that none of the points that are scaled down overlap
-            scaled_overlaps = F.max_pool1d(
-                scaled_overlaps,
-                math.floor(downsample_factor),
-                math.floor(downsample_factor),
-            )
-
-            # interpolate so that if there is one neighboring that is positive, the interpolated value will be greater than 1
-            scaled_overlaps = F.interpolate(
-                scaled_overlaps.unsqueeze(0),
-                scale_factor=1 / remaining_factor,
-                mode="linear",
-                align_corners=True,
-            ).squeeze(0)
-
-        window_length = (
-            nominal_window_length
-            if max_processing_resolution is None
-            else min(nominal_window_length, max_processing_resolution)
-        )
-        window_step = max(1, math.floor(nominal_window_step / downsample_factor))
-
-        window_avg_field_strength = F.avg_pool1d(
-            torch.norm(scaled_data.magnetic_field, dim=1).unsqueeze(0),
-            window_length,
-            window_step,
-        ).squeeze(0)
-        window_overlaps = (
-            F.max_pool1d(scaled_overlaps, window_length, window_step).squeeze(0) > 0
-        )
-
-        # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
-        window_data = scaled_data.sliding_windows(window_length, window_step)
-        window_starts = (
-            torch.arange(len(window_data), device=scaled_data.device)
-            * window_step
-            * downsample_factor
-        ).to(int)
-
-        window_frames = _sliding_frames(scaled_data, window_length, window_step)
-
-        window_vertical_directions = _sliding_vertical_directions(
-            scaled_data,
-            window_length,
-            window_step,
-            window_data,
-            window_frames,
-            window_avg_field_strength,
-            batch_size,
-            n_trial_axes,
-        )
-
-        window_smoothness = F.avg_pool1d(
-            smooth_angles.unsqueeze(0), window_length, window_step
-        ).squeeze(0)
-
-        output = _batch_process(
-            batch_size,
-            nominal_window_length,
-            sample_spacing,
-            threshold_frame_quality,
-            threshold_diff,
-            threshold_fit,
-            threshold_walen_slope,
-            threshold_flow_field_alignment,
-            n_trial_axes,
-            window_overlaps,
-            window_data,
-            window_frames,
-            window_starts,
-            window_vertical_directions,
-            contains_existing,
-            window_smoothness,
+        output = _detect_for_window_length(
+            data=data,
+            contains_existing=contains_existing,
+            nominal_window_length=nominal_window_length,
+            nominal_window_step=nominal_window_step,
+            batch_size=batch_size,
+            sample_spacing=sample_spacing,
+            threshold_frame_quality=threshold_frame_quality,
+            threshold_diff=threshold_diff,
+            threshold_fit=threshold_fit,
+            threshold_walen_slope=threshold_walen_slope,
+            threshold_flow_field_alignment=threshold_flow_field_alignment,
+            n_trial_axes=n_trial_axes,
+            max_processing_resolution=max_processing_resolution,
         )
 
         if output is None:
@@ -331,8 +177,270 @@ def detect_flux_ropes(
     return xarray.concat(output_datasets, dim="event")
 
 
+def _detect_for_window_length(
+    data,
+    contains_existing,
+    nominal_window_length,
+    nominal_window_step,
+    batch_size,
+    sample_spacing,
+    threshold_frame_quality,
+    threshold_diff,
+    threshold_fit,
+    threshold_walen_slope,
+    threshold_flow_field_alignment,
+    n_trial_axes,
+    max_processing_resolution,
+):
+    """
+    detect flux ropes using sliding windows of a single nominal length. marks the
+    samples covered by newly detected flux ropes in contains_existing (in place).
+    returns None if none were found
+    """
+    # bundle these together so they can be downsampled and windowed together
+    original_timeseries = TensorDict(
+        data=data,
+        smooth_angles=_calculate_smooth_angles(data, nominal_window_length),
+        overlaps=contains_existing.to(float),
+        batch_size=data.batch_size,
+        device=data.device,
+    )
+    scaled, window_length, window_step, windows = _downsample_and_window(
+        original_timeseries,
+        nominal_window_length,
+        nominal_window_step,
+        max_processing_resolution,
+    )
+
+    # one row per candidate window. each batch processing stage can drop
+    # some rows if they need to be filtered out.
+    # the results of each stage are added as new fields.
+    # to avoid loading all of the windows into memory, this dict
+    # contains the indices of the windowed samples.
+    remaining_sliding_windows = TensorDict(
+        window_index=torch.arange(len(windows), device=windows["start"].device),
+        window_start=windows["start"],
+        batch_size=windows.batch_size,
+    )
+
+    # estimate the HT frames
+    remaining_sliding_windows["frame"] = _sliding_frames(
+        scaled["data"], window_length, window_step
+    )
+
+    # first, filter out windows
+    # where there is overlap with already-detected events,
+    # or the magnetic field is not smooth enough
+    window_overlaps = windows["samples", "overlaps"].amax(dim=1) > 0
+    window_smoothness = windows["samples", "smooth_angles"].mean(dim=1)
+    remaining_sliding_windows = remaining_sliding_windows[
+        (~window_overlaps) & (window_smoothness >= 0.98)
+    ]
+
+    # stages of expensive batch processing,
+    # which are performed on batches
+    # to reduce memory usage. the later stages are more expensive,
+    # hence this approach.
+    stages = [
+        partial(
+            _find_and_check_vertical_directions,
+            batch_size=batch_size,
+            n_trial_axes=n_trial_axes,
+        ),
+        partial(
+            _get_frame_quality_mask, threshold_frame_quality=threshold_frame_quality
+        ),
+        partial(
+            _find_axes,
+            threshold_diff=threshold_diff,
+            threshold_walen_slope=threshold_walen_slope,
+            threshold_flow_field_alignment=threshold_flow_field_alignment,
+            n_trial_axes=n_trial_axes,
+        ),
+        partial(
+            _validate_map,
+            nominal_window_length=nominal_window_length,
+            sample_spacing=sample_spacing,
+            threshold_fit=threshold_fit,
+        ),
+    ]
+    for stage in stages:
+        if len(remaining_sliding_windows) == 0:
+            return None
+
+        passed = []
+        for batch in remaining_sliding_windows.split(batch_size):
+            mask, results = stage(batch, windows["samples", "data"][batch["window_index"]])
+            batch.update(results)
+            passed.append(batch[mask])
+        remaining_sliding_windows = torch.cat(passed)
+
+    is_new = torch.zeros(
+        len(remaining_sliding_windows), dtype=torch.bool, device=windows["start"].device
+    )
+    for i in torch.argsort(remaining_sliding_windows["residue_diff"], descending=False):
+        start = remaining_sliding_windows["window_start"][i]
+
+        if torch.any(contains_existing[start : start + nominal_window_length]):
+            continue
+
+        contains_existing[start : start + nominal_window_length] = True
+        is_new[i] = True
+
+    remaining_sliding_windows = remaining_sliding_windows[is_new]
+
+    if len(remaining_sliding_windows) == 0:
+        return None
+
+    temporal_scale = (
+        torch.ones_like(remaining_sliding_windows["window_start"], dtype=torch.float32)
+        * nominal_window_length
+        * sample_spacing
+    )
+    frames = remaining_sliding_windows["frame"]
+    axes = remaining_sliding_windows["axis"]
+    dx_dt = torch.linalg.norm(
+        frames - (frames * axes).sum(dim=-1, keepdims=True) * axes,
+        dim=-1,
+    )
+    remaining_sliding_windows["window_length"] = torch.full_like(
+        remaining_sliding_windows["window_start"], nominal_window_length
+    )
+    remaining_sliding_windows["temporal_scale"] = temporal_scale
+    remaining_sliding_windows["spatial_scale"] = dx_dt * temporal_scale
+
+    # TODO use a coord instead of separate variables
+    for i, component in enumerate("xyz"):
+        remaining_sliding_windows[f"axis_{component}"] = axes[:, i]
+        remaining_sliding_windows[f"velocity_{component}"] = frames[:, i]
+
+    return xarray.Dataset(
+        data_vars={
+            name: (field.dims, remaining_sliding_windows[name].cpu().numpy())
+            for name, field in DetectedFluxRopes.to_schema().data_vars.items()
+        }
+    )
+
+
+def _downsample_and_window(
+    original_timeseries,
+    nominal_window_length,
+    nominal_window_step,
+    max_processing_resolution,
+):
+    """
+    downsample timeseries so that a window of nominal_window_length
+    samples spans at most max_processing_resolution samples, then split it
+    into sliding windows.
+
+    :param original_timeseries: TensorDict of fields with shape (time, ...), at full resolution.
+    :param nominal_window_length: Window length in full resolution samples.
+    :param nominal_window_step: Window step in full resolution samples.
+    :param max_processing_resolution: Maximum window length after downsampling,
+        or None to keep full resolution.
+    :return: A tuple ``(series, window_length, window_step, windows)``:
+
+        - ``series``: the downsampled series, shape (downsampled_time, ...).
+        - ``window_length``: window length in downsampled samples.
+        - ``window_step``: window step in downsampled samples.
+        - ``windows``: TensorDict with batch size (window,) holding
+
+          - ``start``: each window's start as a full resolution sample index.
+          - ``samples``: lazy view of the series, shape
+            (window, window_length, ...), where window_length is in
+            downsampled samples. Indexing it with a tensor of window indices
+            copies just those windows.
+    """
+    downsample_factor = (
+        1
+        if max_processing_resolution is None
+        else max(nominal_window_length / max_processing_resolution, 1)
+    )
+
+    if downsample_factor > 1:
+        # first, bring within a factor of 2 to max_processing_resolution
+        kernel_size = math.floor(downsample_factor)
+
+        # at this point, the window length is still the following factor above max processing resolution
+        remaining_factor = (
+            nominal_window_length / kernel_size
+        ) / max_processing_resolution
+
+        # apply downsample
+        downsampled_timeseries = original_timeseries.apply(
+            partial(
+                _downsample, kernel_size=kernel_size, scale_factor=1 / remaining_factor
+            ),
+            batch_size=[],
+        )
+
+        # the new length isn't known before the op runs, so apply it
+        # unbatched and then take the batch size from the first dim
+        downsampled_timeseries = downsampled_timeseries.auto_batch_size_(batch_dims=1)
+        window_length = max_processing_resolution
+    else:
+        downsampled_timeseries = original_timeseries
+        window_length = nominal_window_length
+
+    window_step = max(1, math.floor(nominal_window_step / downsample_factor))
+
+    # window i covers downsampled samples i * window_step to
+    # i * window_step + window_length
+    n_window = (len(downsampled_timeseries) - window_length) // window_step + 1
+    # full-resolution sample indices
+    window_starts = (
+        torch.arange(n_window, device=downsampled_timeseries.device)
+        * window_step * downsample_factor
+    ).to(int)
+
+    # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
+    window_samples = downsampled_timeseries.apply(
+        lambda field: (
+            field
+            # puts each window's samples last: (window, ..., size)
+            .unfold(0, window_length, window_step)
+            # move them next to the window axis: (window, size, ...)
+            .movedim(-1, 1)
+        ),
+        batch_size=[n_window, window_length],
+    )
+    windows = TensorDict(
+        start=window_starts,
+        samples=window_samples,
+        batch_size=[n_window],
+    )
+
+    return downsampled_timeseries, window_length, window_step, windows
+
+
+def _downsample(field: torch.Tensor, kernel_size, scale_factor) -> torch.Tensor:
+    """
+    average field, shape (time, ...), over blocks of kernel_size samples, then
+    linearly resample the result by scale_factor
+    """
+    # torch 1D operations require input of shape (batch, channel, time)
+    n_time = field.shape[0]
+    # (time,) or (time, 3) -> (1, channel, time)
+    channels_first = field.reshape(n_time, -1).T.unsqueeze(0)
+
+    pooled = F.avg_pool1d(channels_first, kernel_size, kernel_size)
+
+    # interpolate to bring window length down to max_processing_resolution
+    resampled = F.interpolate(
+        pooled,
+        scale_factor=scale_factor,
+        mode="linear",
+        align_corners=True,
+    )
+
+    # (1, channel, new_time) -> (new_time, channel)
+    time_first = resampled.squeeze(0).T
+    # -> (new_time,) or (new_time, 3)
+    return time_first.reshape(time_first.shape[0], *field.shape[1:])
+
+
 def _calculate_smooth_angles(data, window_length):
-    magnetic_field = data.magnetic_field
+    magnetic_field = data["magnetic_field"]
 
     kernel_size = max(window_length // 10, 1)
 
@@ -351,304 +459,20 @@ def _calculate_smooth_angles(data, window_length):
     return (F.normalize(smoothed, dim=1) * F.normalize(magnetic_field)).sum(dim=1)
 
 
-def _batch_process(
-    batch_size,
-    nominal_window_length,
-    sample_spacing,
-    threshold_frame_quality,
-    threshold_diff,
-    threshold_fit,
-    threshold_walen_slope,
-    threshold_flow_field_alignment,
-    n_trial_axes,
-    window_overlaps,
-    window_data,
-    window_frames,
-    window_starts,
-    window_vertical_directions,
-    contains_existing,
-    window_smoothness,
-):
-    window_mask = (~window_overlaps) & (window_smoothness >= 0.98)
-
-    def execute_batched(function, dense=True):
-        good_windows = torch.nonzero(window_mask).flatten()
-
-        batch_outputs = []
-
-        for batch_indices in good_windows.split(batch_size):
-            if len(batch_indices) == 0:
-                continue
-
-            batch_data = window_data[batch_indices]
-
-            batch_output = function(batch_indices=batch_indices, batch_data=batch_data)
-            if type(batch_output) != tuple:
-                batch_output = (batch_output,)
-            else:
-                batch_mask = batch_output[0]
-                batch_output = (batch_mask, *[x[batch_mask] for x in batch_output[1:]])
-            batch_outputs.append(batch_output)
-
-        combined_output = [torch.concat(x, dim=0) for x in zip(*batch_outputs)]
-        new_mask = combined_output[0]
-        assert len(new_mask) == len(good_windows)
-
-        window_mask.scatter_(0, good_windows, new_mask)
-
-        if len(combined_output) > 1:
-            combined_output = combined_output[1:]
-            new_good_windows = torch.nonzero(window_mask).flatten()
-
-            if not dense:
-                combined_output = tuple(
-                    torch.sparse_coo_tensor(
-                        new_good_windows.unsqueeze(0),
-                        x,
-                        (len(window_mask), *x.shape[1:]),
-                        check_invariants=False,
-                        is_coalesced=True,
-                    )
-                    for x in combined_output
-                )
-            else:
-                combined_output = tuple(
-                    torch.full(
-                        (len(window_mask), *x.shape[1:]),
-                        torch.nan,
-                        device=x.device,
-                        dtype=x.dtype,
-                    ).index_put_((new_good_windows,), x)
-                    for x in combined_output
-                )
-
-            return combined_output[0] if len(combined_output) == 1 else combined_output
-
-    if ~torch.any(window_mask):
-        return None
-
-    execute_batched(
-        partial(
-            _get_inflection_point_mask,
-            window_vertical_directions=window_vertical_directions,
-        )
-    )
-
-    # todo: fix error when execute_batched with return values is given 0 good indices
-    if ~torch.any(window_mask):
-        return None
-
-    window_frame_quality = execute_batched(
-        partial(
-            _get_frame_quality_mask,
-            threshold_frame_quality=threshold_frame_quality,
-            window_frames=window_frames,
-        )
-    )
-
-    if ~torch.any(window_mask):
-        return None
-
-    window_axes, window_error_diff, window_walen_slope, window_flow_field_alignment = (
-        execute_batched(
-            partial(
-                _find_axes,
-                threshold_diff=threshold_diff,
-                threshold_walen_slope=threshold_walen_slope,
-                threshold_flow_field_alignment=threshold_flow_field_alignment,
-                n_trial_axes=n_trial_axes,
-                window_frames=window_frames,
-                window_vertical_directions=window_vertical_directions,
-            )
-        )
-    )
-
-    if ~torch.any(window_mask):
-        return None
-
-    (
-        window_map_Az,
-        window_map_Bx,
-        window_map_By,
-        window_map_Bz,
-        window_map_Jx,
-        window_map_Jy,
-        window_map_Jz,
-        window_map_core_mask,
-        window_error_fit,
-    ) = execute_batched(
-        partial(
-            _validate_map,
-            window_axes=window_axes,
-            window_frames=window_frames,
-            window_walen_slope=window_walen_slope,
-            nominal_window_length=nominal_window_length,
-            sample_spacing=sample_spacing,
-            threshold_fit=threshold_fit,
-        ),
-        dense=False,
-    )
-    window_error_fit = window_error_fit.to_dense()
-
-    good_indices = torch.nonzero(window_mask).flatten()
-    for i in good_indices[
-        torch.argsort(window_error_diff.index_select(0, good_indices), descending=False)
-    ]:
-        start = window_starts[i]
-
-        if torch.any(contains_existing[start : start + nominal_window_length]):
-            window_mask[i] = False
-            continue
-
-        contains_existing[start : start + nominal_window_length] = True
-
-    if ~torch.any(window_mask):
-        return None
-
-    temporal_scale = (
-        torch.ones_like(window_starts, dtype=torch.float32)
-        * nominal_window_length
-        * sample_spacing
-    )
-    dx_dt = torch.linalg.norm(
-        window_frames
-        - (window_frames * window_axes).sum(dim=-1, keepdims=True) * window_axes,
-        dim=-1,
-    )
-    spatial_scale = dx_dt * temporal_scale
-
-    remaining_indices = torch.nonzero(window_mask).flatten()
-
-    dataset = xarray.Dataset(
-        data_vars={
-            "window_start": (["event"], window_starts[remaining_indices].cpu().numpy()),
-            "window_length": (
-                ["event"],
-                np.ones(len(remaining_indices), dtype=int) * nominal_window_length,
-            ),
-            "temporal_scale": (
-                ["event"],
-                temporal_scale[remaining_indices].cpu().numpy(),
-            ),
-            "spatial_scale": (
-                ["event"],
-                spatial_scale[remaining_indices].cpu().numpy(),
-            ),
-            "residue_diff": (
-                ["event"],
-                window_error_diff[remaining_indices].cpu().numpy(),
-            ),
-            "residue_fit": (
-                ["event"],
-                window_error_fit[remaining_indices].cpu().numpy(),
-            ),
-            "walen_slope": (
-                ["event"],
-                window_walen_slope[remaining_indices].cpu().numpy(),
-            ),
-            "frame_quality": (
-                ["event"],
-                window_frame_quality[remaining_indices].cpu().numpy(),
-            ),
-            "flow_field_alignment": (
-                ["event"],
-                window_flow_field_alignment[remaining_indices].cpu().numpy(),
-            ),
-            "axis_x": (["event"], window_axes[remaining_indices, 0].cpu().numpy()),
-            "axis_y": (["event"], window_axes[remaining_indices, 1].cpu().numpy()),
-            "axis_z": (["event"], window_axes[remaining_indices, 2].cpu().numpy()),
-            "velocity_x": (
-                ["event"],
-                window_frames[remaining_indices, 0].cpu().numpy(),
-            ),
-            "velocity_y": (
-                ["event"],
-                window_frames[remaining_indices, 1].cpu().numpy(),
-            ),
-            "velocity_z": (
-                ["event"],
-                window_frames[remaining_indices, 2].cpu().numpy(),
-            ),
-            "map_Az": (
-                ["event", "y", "x"],
-                window_map_Az.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_Bx": (
-                ["event", "y", "x"],
-                window_map_Bx.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_By": (
-                ["event", "y", "x"],
-                window_map_By.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_Bz": (
-                ["event", "y", "x"],
-                window_map_Bz.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_Jx": (
-                ["event", "y", "x"],
-                window_map_Jx.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_Jy": (
-                ["event", "y", "x"],
-                window_map_Jy.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_Jz": (
-                ["event", "y", "x"],
-                window_map_Jz.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-            "map_core_mask": (
-                ["event", "y", "x"],
-                window_map_core_mask.index_select(0, remaining_indices)
-                .to_dense()
-                .cpu()
-                .numpy(),
-            ),
-        },
-    )
-
-    return dataset
-
-
 def _find_axes(
+    batch,
     batch_data,
     threshold_walen_slope,
     threshold_flow_field_alignment,
-    batch_indices,
     threshold_diff,
     n_trial_axes,
-    window_frames,
-    window_vertical_directions,
 ):
-    batch_vertical_directions = window_vertical_directions.index_select(
-        0, batch_indices
-    )
-    batch_frames = window_frames.index_select(0, batch_indices)
+    batch_vertical_directions = batch["vertical_direction"]
+    batch_frames = batch["frame"]
 
     # extract individual physical quantities
-    batch_magnetic_field = batch_data.magnetic_field
-    batch_gas_pressure = batch_data.gas_pressure
+    batch_magnetic_field = batch_data["magnetic_field"]
+    batch_gas_pressure = batch_data["gas_pressure"]
 
     batch_normalized_potential = _calculate_normalized_potential(
         batch_magnetic_field, batch_vertical_directions
@@ -663,9 +487,9 @@ def _find_axes(
 
     axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
 
-    batch_velocity = batch_data.velocity
+    batch_velocity = batch_data["velocity"]
 
-    batch_density = batch_data.density
+    batch_density = batch_data["density"]
 
     # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
     # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
@@ -727,7 +551,12 @@ def _find_axes(
         & (Bz_sign == 1)
     )
 
-    return mask, batch_axes, error_diff, walen_slope, flow_field_alignment
+    return mask, {
+        "axis": batch_axes,
+        "residue_diff": error_diff,
+        "walen_slope": walen_slope,
+        "flow_field_alignment": flow_field_alignment,
+    }
 
 
 def _calculate_transverse_pressure(B_magnitude, B_transverse, Pgas, alpha):
@@ -749,42 +578,28 @@ def _calculate_transverse_pressure(B_magnitude, B_transverse, Pgas, alpha):
     return transverse_pressure
 
 
-def _get_inflection_point_mask(batch_data, batch_indices, window_vertical_directions):
-    batch_vertical_directions = window_vertical_directions.index_select(
-        0, batch_indices
-    )
-    batch_magnetic_field = batch_data.magnetic_field
-
-    return _is_good_vertical_component(batch_magnetic_field, batch_vertical_directions)
-
-
-def _get_frame_quality_mask(
-    batch_data, batch_indices, threshold_frame_quality, window_frames
-):
-    batch_frames = window_frames.index_select(0, batch_indices)
-    batch_magnetic_field = batch_data.magnetic_field
-    batch_velocity = batch_data.velocity
+def _get_frame_quality_mask(batch, batch_data, threshold_frame_quality):
+    batch_frames = batch["frame"]
+    batch_magnetic_field = batch_data["magnetic_field"]
+    batch_velocity = batch_data["velocity"]
     batch_electric_field = -torch.cross(batch_velocity, batch_magnetic_field, dim=-1)
 
     frame_quality = _calculate_frame_quality(
         batch_frames, batch_magnetic_field, batch_velocity, batch_electric_field
     )
-    return frame_quality > threshold_frame_quality, frame_quality
+    return frame_quality > threshold_frame_quality, {"frame_quality": frame_quality}
 
 
 def _validate_map(
-    batch_indices,
+    batch,
     batch_data,
-    window_axes,
-    window_frames,
-    window_walen_slope,
     nominal_window_length,
     sample_spacing,
     threshold_fit,
 ):
-    batch_axes = window_axes.index_select(0, batch_indices)
-    batch_frames = window_frames.index_select(0, batch_indices)
-    batch_walen_slope = window_walen_slope.index_select(0, batch_indices)
+    batch_axes = batch["axis"]
+    batch_frames = batch["frame"]
+    batch_walen_slope = batch["walen_slope"]
 
     reconstructed_map = _generate_map(
         batch_data,
@@ -861,25 +676,24 @@ def _validate_map(
         dim=-1,
     )
 
-    return (
-        mask_fit & mask_valid & mask_current & mask_closed,
-        reconstructed_map.magnetic_potential,
-        reconstructed_map.magnetic_field_x,
-        reconstructed_map.magnetic_field_y,
-        reconstructed_map.magnetic_field_z,
-        reconstructed_map.current_density_x,
-        reconstructed_map.current_density_y,
-        reconstructed_map.current_density_z,
-        reconstructed_map.core_mask,
-        reconstructed_map.error_fit,
-    )
+    return mask_fit & mask_valid & mask_current & mask_closed, {
+        "map_Az": reconstructed_map.magnetic_potential,
+        "map_Bx": reconstructed_map.magnetic_field_x,
+        "map_By": reconstructed_map.magnetic_field_y,
+        "map_Bz": reconstructed_map.magnetic_field_z,
+        "map_Jx": reconstructed_map.current_density_x,
+        "map_Jy": reconstructed_map.current_density_y,
+        "map_Jz": reconstructed_map.current_density_z,
+        "map_core_mask": reconstructed_map.core_mask,
+        "residue_fit": reconstructed_map.error_fit,
+    }
 
 
 def _generate_map(
     data, axes, frames, walen_slope, nominal_window_length, sample_spacing
 ):
-    batch_magnetic_field = data.magnetic_field
-    batch_gas_pressure = data.gas_pressure
+    batch_magnetic_field = data["magnetic_field"]
+    batch_gas_pressure = data["gas_pressure"]
 
     alpha = walen_slope**2
 
@@ -913,8 +727,8 @@ def _generate_map(
 
 
 def _sliding_frames(data, window_length, window_step):
-    magnetic_field = data.magnetic_field
-    velocity = data.velocity
+    magnetic_field = data["magnetic_field"]
+    velocity = data["velocity"]
 
     electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
 
@@ -1030,32 +844,21 @@ def _calculate_residue_map(magnetic_field, trial_axes, potential):
     return error_diff
 
 
-def _sliding_vertical_directions(
-    scaled_data,
-    window_length,
-    window_step,
-    windows,
-    window_frames,
-    window_avg_field_strength,
-    batch_size,
-    n_trial_axes,
-):
-    # use conv1d kernel to perform trapezoid integration
-    integration_weight = torch.ones(
-        window_length, dtype=scaled_data.magnetic_field.dtype, device=scaled_data.device
-    )
-    integration_weight[0] = 1 / 2
-    integration_weight[-1] = 1 / 2
-    integration_weight = integration_weight / integration_weight.sum()
-    integration_weight = integration_weight.reshape(1, 1, -1)
+def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_axes):
+    """
+    estimate the flux rope y-axis of each window, and keep only the windows
+    where the field component along it changes sign exactly once
+    """
+    batch_magnetic_field = batch_data["magnetic_field"]
+    window_frames = batch["frame"]
+
+    window_avg_field_strength = torch.norm(batch_magnetic_field, dim=-1).mean(dim=-1)
+
+    # trapezoid-integral mean of each window's field
+    # L samples -> L - 1 gaps
     window_avg_field = (
-        torch.conv1d(
-            scaled_data.magnetic_field.T.unsqueeze(1),
-            weight=integration_weight,
-            stride=window_step,
-        )
-        .squeeze(1)
-        .T
+        torch.trapezoid(batch_magnetic_field, dim=-2)
+        / (batch_magnetic_field.shape[-2] - 1)
     )
 
     avg_field_direction = F.normalize(window_avg_field, dim=-1)
@@ -1076,16 +879,13 @@ def _sliding_vertical_directions(
 
     too_close_indices = torch.nonzero(too_close).flatten()
 
-    for i in range(0, len(too_close_indices), batch_size):
-        too_close_batch_indices = too_close_indices[i : i + batch_size]
-        too_close_field = windows.magnetic_field[too_close_batch_indices]
+    if len(too_close_indices) > 0:
+        too_close_field = batch_magnetic_field[too_close_indices]
         too_close_mean_directions = avg_field_direction.index_select(
-            0, too_close_batch_indices
+            0, too_close_indices
         )
-        too_close_frames = window_frames.index_select(0, too_close_batch_indices)
-        too_close_path_directions = path_direction.index_select(
-            0, too_close_batch_indices
-        )
+        too_close_frames = window_frames.index_select(0, too_close_indices)
+        too_close_path_directions = path_direction.index_select(0, too_close_indices)
 
         # basis vectors will be the ones with the lowest component value in too_close_path_direction,
         # effectively the one with the lowest dot product and thus most perpendicular
@@ -1137,7 +937,7 @@ def _sliding_vertical_directions(
         )
         possible_vertical_directions *= x_unit_sign
 
-        n_too_close = len(too_close_batch_indices)
+        n_too_close = len(too_close_indices)
 
         # number processed = n in vertical axis batch * n too close
         # -> n in axis batch = number processed / n too close
@@ -1194,8 +994,11 @@ def _sliding_vertical_directions(
         best = torch.take_along_dim(
             possible_vertical_directions, argmin[:, None, None], dim=1
         ).squeeze(1)
-        vertical_directions[too_close_batch_indices] = best
-    return vertical_directions
+        vertical_directions[too_close_indices] = best
+
+    return _is_good_vertical_component(batch_magnetic_field, vertical_directions), {
+        "vertical_direction": vertical_directions
+    }
 
 
 def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
