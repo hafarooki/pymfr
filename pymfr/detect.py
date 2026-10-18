@@ -474,6 +474,7 @@ def _batch_process(
         if torch.any(contains_existing[start : start + nominal_window_length]):
             window_mask[i] = False
             continue
+
         contains_existing[start : start + nominal_window_length] = True
 
     if ~torch.any(window_mask):
