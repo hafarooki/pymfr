@@ -1,14 +1,16 @@
 import math
+from collections.abc import Callable
 from functools import partial
+from typing import Self
 
 import numpy as np
 import pandera.xarray as pa
 import torch
 import torch.nn.functional as F
-import torch.utils.data
 import tqdm
 import xarray
 from pandera.typing.xarray import Dataset
+from tensordict import TensorClass
 
 from pymfr.reconstruct import reconstruct_map
 from pymfr.residue import (
@@ -43,6 +45,58 @@ class DetectedFluxRopes(pa.DatasetModel):
     map_Jy: np.float32 = pa.Field(dims=("event", "y", "x"))
     map_Jz: np.float32 = pa.Field(dims=("event", "y", "x"))
     map_core_mask: bool = pa.Field(dims=("event", "y", "x"))
+
+
+class _InputData(TensorClass):
+    magnetic_field: torch.Tensor
+    velocity: torch.Tensor
+    density: torch.Tensor
+    gas_pressure: torch.Tensor
+
+    def __post_init__(self) -> None:
+        # note that this reruns a lot so this needs to be limited to
+        # things that do not involve a GPU sync
+        assert self.magnetic_field.shape[-1] == 3
+        assert self.velocity.shape == self.magnetic_field.shape
+        assert self.density.shape == self.magnetic_field.shape[:-1]
+        assert self.gas_pressure.shape == self.magnetic_field.shape[:-1]
+
+    def resample_time(self, function: Callable[[torch.Tensor], torch.Tensor]) -> Self:
+        """
+        run a torch 1D operation (e.g., avg_pool1d and interpolate) along the time axis
+        of each field. those operations require input of shape (batch, channel, time)
+        """
+
+        def resample_field(field: torch.Tensor) -> torch.Tensor:
+            n_time = field.shape[0]
+            # (time,) or (time, 3) -> (1, channel, time)
+            channels_first = field.reshape(n_time, -1).T.unsqueeze(0)
+            # (1, channel, time) -> (1, channel, new_time)
+            resampled = function(channels_first)
+            # (1, channel, new_time) -> (new_time, channel)
+            time_first = resampled.squeeze(0).T
+            # -> (new_time,) or (new_time, 3)
+            return time_first.reshape(time_first.shape[0], *field.shape[1:])
+
+        # the new length isn't known before the op runs, so apply it
+        # unbatched and then take the batch size from the first dim
+        return self.apply(resample_field, batch_size=[]).auto_batch_size_(batch_dims=1)
+
+    def sliding_windows(self, size: int, step: int) -> Self:
+        """
+        splits the time axis into overlapping windows without copying:
+        (time, ...) -> (window, size, ...), where window i covers samples
+        i * step to i * step + size
+        """
+        n_window = (self.batch_size[0] - size) // step + 1
+
+        def window_field(field: torch.Tensor) -> torch.Tensor:
+            # unfold puts each window's samples last: (window, ..., size)
+            windows = field.unfold(0, size, step)
+            # move them next to the window axis: (window, size, ...)
+            return windows.movedim(-1, 1)
+
+        return self.apply(window_field, batch_size=[n_window, size])
 
 
 @pa.check_types
@@ -96,31 +150,45 @@ def detect_flux_ropes(
     :return: A ``DetectedFluxRopes`` dataset describing the detected flux ropes (empty along ``event`` if none were found).
     """
 
-    full_tensor = _pack_data(magnetic_field, velocity, density, gas_pressure)
-
     if cuda is None:
         cuda = torch.cuda.is_available()
 
-    if cuda:
-        full_tensor = full_tensor.cuda()
+    # convert all arrays to tensor so that numpy arrays can be given
+    data = _InputData(
+        magnetic_field=magnetic_field,
+        velocity=velocity,
+        density=density,
+        gas_pressure=gas_pressure,
+        batch_size=[len(magnetic_field)],
+        device="cuda" if cuda else "cpu",
+    ).float()  # convert to float32 explicitly also, for consistent behavior regardless of input dtype
+
+    assert not any(torch.isnan(field).any() for field in data.values()), (
+        "Data contains missing values (nan). PyMFR does not automatically handle missing values. Instead, please keep track of which data points contain nans beforehand, interpolate or fill, and then remove flux ropes with intervals containing too many NaNs."
+    )
 
     # these are updated as the algorithm runs
     # contains_existing keeps track of samples that were already confirmed as MFRs
     # for longer window lengths so that shorter windows do not attempt to overwrite them
     contains_existing = torch.zeros(
-        len(magnetic_field), dtype=torch.bool, device=full_tensor.device
+        len(magnetic_field), dtype=torch.bool, device=data.device
     )
 
     output_datasets = []
 
-    sliding_windows = _get_sliding_windows(window_lengths, window_steps)
-
-    for nominal_window_length, nominal_window_step in (
-        sliding_windows if not progress_bar else tqdm.tqdm(sliding_windows)
+    assert len(set(window_lengths)) == len(window_lengths), (
+        "window lengths must be unique"
+    )
+    # use sliding windows sorted by longest window length to shortest
+    # because the algorithm gives preference to longer MFRs candidates over shorter ones
+    # since long MFRs tend to show up as a bunch of small MFRs (especially ICMEs)
+    for nominal_window_length, nominal_window_step in tqdm.tqdm(
+        sorted(zip(window_lengths, window_steps, strict=True), reverse=True),
+        disable=not progress_bar,
     ):
-        scaled_tensor = full_tensor
+        scaled_data = data
 
-        smooth_angles = _calculate_smooth_angles(full_tensor, nominal_window_length)
+        smooth_angles = _calculate_smooth_angles(data, nominal_window_length)
 
         scaled_overlaps = contains_existing.to(float).unsqueeze(0)
         downsample_factor = (
@@ -130,11 +198,13 @@ def detect_flux_ropes(
         )
         if downsample_factor > 1:
             # first, bring within a factor of 2 to max_processing_resolution
-            scaled_tensor = F.avg_pool1d(
-                full_tensor.T,
-                math.floor(downsample_factor),
-                math.floor(downsample_factor),
-            ).T
+            scaled_data = data.resample_time(
+                partial(
+                    F.avg_pool1d,
+                    kernel_size=math.floor(downsample_factor),
+                    stride=math.floor(downsample_factor),
+                )
+            )
 
             # at this point, the window length is still the following factor above max processing resolution
             remaining_factor = (
@@ -142,15 +212,13 @@ def detect_flux_ropes(
             ) / max_processing_resolution
 
             # interpolate to bring window length down to max_processing_resolution
-            scaled_tensor = (
-                F.interpolate(
-                    scaled_tensor.T.unsqueeze(0),
+            scaled_data = scaled_data.resample_time(
+                partial(
+                    F.interpolate,
                     scale_factor=1 / remaining_factor,
                     mode="linear",
                     align_corners=True,
                 )
-                .squeeze(0)
-                .T
             )
 
             # do the same for smooth angles
@@ -189,7 +257,7 @@ def detect_flux_ropes(
         window_step = max(1, math.floor(nominal_window_step / downsample_factor))
 
         window_avg_field_strength = F.avg_pool1d(
-            torch.norm(scaled_tensor[:, :3], dim=1).unsqueeze(0),
+            torch.norm(scaled_data.magnetic_field, dim=1).unsqueeze(0),
             window_length,
             window_step,
         ).squeeze(0)
@@ -198,19 +266,17 @@ def detect_flux_ropes(
         )
 
         # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
-        window_data = scaled_tensor.unfold(
-            size=window_length, step=window_step, dimension=0
-        )
+        window_data = scaled_data.sliding_windows(window_length, window_step)
         window_starts = (
-            torch.arange(len(window_data), device=scaled_tensor.device)
+            torch.arange(len(window_data), device=scaled_data.device)
             * window_step
             * downsample_factor
         ).to(int)
 
-        window_frames = _sliding_frames(scaled_tensor, window_length, window_step)
+        window_frames = _sliding_frames(scaled_data, window_length, window_step)
 
         window_vertical_directions = _sliding_vertical_directions(
-            scaled_tensor,
+            scaled_data,
             window_length,
             window_step,
             window_data,
@@ -241,7 +307,6 @@ def detect_flux_ropes(
             window_vertical_directions,
             contains_existing,
             window_smoothness,
-            full_tensor,
         )
 
         if output is None:
@@ -266,8 +331,8 @@ def detect_flux_ropes(
     return xarray.concat(output_datasets, dim="event")
 
 
-def _calculate_smooth_angles(tensor, window_length):
-    magnetic_field = tensor[..., :3]
+def _calculate_smooth_angles(data, window_length):
+    magnetic_field = data.magnetic_field
 
     kernel_size = max(window_length // 10, 1)
 
@@ -284,25 +349,6 @@ def _calculate_smooth_angles(tensor, window_length):
     ).T
 
     return (F.normalize(smoothed, dim=1) * F.normalize(magnetic_field)).sum(dim=1)
-
-
-class SlidingWindowDataset(torch.utils.data.Dataset):
-    def __init__(self, window_data, good_windows, batch_size):
-        super(SlidingWindowDataset).__init__()
-        self.window_data = window_data
-        self.good_windows = good_windows
-        self.batch_size = batch_size
-
-    def __len__(self):
-        return math.ceil(len(self.good_windows) / self.batch_size)
-
-    def __getitem__(self, idx):
-        batch_indices = self.good_windows[
-            idx * self.batch_size : (idx + 1) * self.batch_size
-        ]
-        return (
-            self.window_data.index_select(0, batch_indices).transpose(1, 2).contiguous()
-        )
 
 
 def _batch_process(
@@ -322,32 +368,19 @@ def _batch_process(
     window_vertical_directions,
     contains_existing,
     window_smoothness,
-    full_tensor,
 ):
     window_mask = (~window_overlaps) & (window_smoothness >= 0.98)
 
     def execute_batched(function, dense=True):
         good_windows = torch.nonzero(window_mask).flatten()
 
-        dataset = SlidingWindowDataset(window_data, good_windows, batch_size)
-        dataloader = torch.utils.data.DataLoader(dataset, num_workers=0)
-
         batch_outputs = []
 
-        for i_batch, batch_data in enumerate(dataloader):
-            batch_data = batch_data[
-                0
-            ]  # batch dimension is taken care of by dataset instead of dataloader
-            batch_indices = good_windows[
-                i_batch * batch_size : (i_batch + 1) * batch_size
-            ]
-
+        for batch_indices in good_windows.split(batch_size):
             if len(batch_indices) == 0:
                 continue
 
-            assert len(batch_indices) == len(batch_data), (
-                f"{len(batch_indices)} vs {len(batch_data)}"
-            )
+            batch_data = window_data[batch_indices]
 
             batch_output = function(batch_indices=batch_indices, batch_data=batch_data)
             if type(batch_output) != tuple:
@@ -606,39 +639,6 @@ def _batch_process(
     return dataset
 
 
-def _pack_data(magnetic_field, velocity, density, gas_pressure):
-    # all arrays must have the same number of samples
-    n_sample = len(magnetic_field)
-    assert (
-        n_sample
-        == len(magnetic_field)
-        == len(velocity)
-        == len(density)
-        == len(gas_pressure)
-    )
-
-    # ensure all arrays have the correct shapes
-    assert magnetic_field.shape == (n_sample, 3)
-    assert velocity.shape == (n_sample, 3)
-    assert density.shape == (n_sample,)
-    assert gas_pressure.shape == (n_sample,)
-
-    # convert all arrays to tensor so that numpy arrays can be given
-    magnetic_field = torch.as_tensor(magnetic_field, dtype=torch.float32)
-    velocity = torch.as_tensor(velocity, dtype=torch.float32)
-    density = torch.as_tensor(density, dtype=torch.float32).unsqueeze(1)
-    gas_pressure = torch.as_tensor(gas_pressure, dtype=torch.float32).unsqueeze(1)
-
-    # combine needed data into one tensor
-    tensor = torch.concat([magnetic_field, velocity, density, gas_pressure], dim=1)
-
-    assert not torch.any(torch.isnan(tensor)), (
-        "Data contains missing values (nan). PyMFR does not automatically handle missing values. Instead, please keep track of which data points contain nans beforehand, interpolate or fill, and then remove flux ropes with intervals containing too many NaNs."
-    )
-
-    return tensor
-
-
 def _find_axes(
     batch_data,
     threshold_walen_slope,
@@ -655,8 +655,8 @@ def _find_axes(
     batch_frames = window_frames.index_select(0, batch_indices)
 
     # extract individual physical quantities
-    batch_magnetic_field = batch_data[:, :, :3]
-    batch_gas_pressure = batch_data[:, :, 7]
+    batch_magnetic_field = batch_data.magnetic_field
+    batch_gas_pressure = batch_data.gas_pressure
 
     batch_normalized_potential = _calculate_normalized_potential(
         batch_magnetic_field, batch_vertical_directions
@@ -671,14 +671,14 @@ def _find_axes(
 
     axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
 
-    batch_velocity = batch_data[:, :, 3:6]
+    batch_velocity = batch_data.velocity
 
-    batch_density = batch_data[:, :, 6]
+    batch_density = batch_data.density
 
     # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
     # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
     batch_alfven_velocity = (
-        batch_magnetic_field[:, :, :3] / torch.sqrt(batch_density.unsqueeze(-1))
+        batch_magnetic_field / torch.sqrt(batch_density.unsqueeze(-1))
     ) * 21.8114
     batch_alfven_velocity = torch.where(
         batch_density[:, :, None] == 0, torch.inf, batch_alfven_velocity
@@ -761,7 +761,7 @@ def _get_inflection_point_mask(batch_data, batch_indices, window_vertical_direct
     batch_vertical_directions = window_vertical_directions.index_select(
         0, batch_indices
     )
-    batch_magnetic_field = batch_data[:, :, :3]
+    batch_magnetic_field = batch_data.magnetic_field
 
     return _is_good_vertical_component(batch_magnetic_field, batch_vertical_directions)
 
@@ -770,8 +770,8 @@ def _get_frame_quality_mask(
     batch_data, batch_indices, threshold_frame_quality, window_frames
 ):
     batch_frames = window_frames.index_select(0, batch_indices)
-    batch_magnetic_field = batch_data[:, :, :3]
-    batch_velocity = batch_data[:, :, 3:6]
+    batch_magnetic_field = batch_data.magnetic_field
+    batch_velocity = batch_data.velocity
     batch_electric_field = -torch.cross(batch_velocity, batch_magnetic_field, dim=-1)
 
     frame_quality = _calculate_frame_quality(
@@ -886,8 +886,8 @@ def _validate_map(
 def _generate_map(
     data, axes, frames, walen_slope, nominal_window_length, sample_spacing
 ):
-    batch_magnetic_field = data[:, :, :3]
-    batch_gas_pressure = data[:, :, 7]
+    batch_magnetic_field = data.magnetic_field
+    batch_gas_pressure = data.gas_pressure
 
     alpha = walen_slope**2
 
@@ -896,7 +896,7 @@ def _generate_map(
         frames - (frames * axes).sum(dim=-1, keepdims=True) * axes, dim=-1
     )
 
-    dt = time_elapsed / data.shape[-2]
+    dt = time_elapsed / batch_magnetic_field.shape[-2]
     dx = dx_dt * dt
 
     x_axis = F.normalize(
@@ -920,9 +920,9 @@ def _generate_map(
     return reconstructed_map
 
 
-def _sliding_frames(tensor, window_length, window_step):
-    magnetic_field = tensor[..., :3]
-    velocity = tensor[..., 3:6]
+def _sliding_frames(data, window_length, window_step):
+    magnetic_field = data.magnetic_field
+    velocity = data.velocity
 
     electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
 
@@ -934,13 +934,13 @@ def _sliding_frames(tensor, window_length, window_step):
     ]
     coefficient_matrix = torch.zeros(
         (
-            *tensor.shape[:-2],
-            math.floor((tensor.shape[-2] - window_length) / window_step + 1),
+            *magnetic_field.shape[:-2],
+            math.floor((magnetic_field.shape[-2] - window_length) / window_step + 1),
             3,
             3,
         ),
-        device=tensor.device,
-        dtype=tensor.dtype,
+        device=data.device,
+        dtype=magnetic_field.dtype,
     )
     for i in range(3):
         for j in range(3):
@@ -957,7 +957,7 @@ def _sliding_frames(tensor, window_length, window_step):
         # lstsq appears to be buggy on GPU so do it on CPU if it fails
         frames = torch.linalg.lstsq(
             coefficient_matrix.cpu(), dependent_values.cpu()
-        ).solution.to(tensor.device)
+        ).solution.to(data.device)
 
     return frames
 
@@ -1039,7 +1039,7 @@ def _calculate_residue_map(magnetic_field, trial_axes, potential):
 
 
 def _sliding_vertical_directions(
-    scaled_tensor,
+    scaled_data,
     window_length,
     window_step,
     windows,
@@ -1050,7 +1050,7 @@ def _sliding_vertical_directions(
 ):
     # use conv1d kernel to perform trapezoid integration
     integration_weight = torch.ones(
-        window_length, dtype=scaled_tensor.dtype, device=scaled_tensor.device
+        window_length, dtype=scaled_data.magnetic_field.dtype, device=scaled_data.device
     )
     integration_weight[0] = 1 / 2
     integration_weight[-1] = 1 / 2
@@ -1058,7 +1058,7 @@ def _sliding_vertical_directions(
     integration_weight = integration_weight.reshape(1, 1, -1)
     window_avg_field = (
         torch.conv1d(
-            scaled_tensor[:, :3].T.unsqueeze(1),
+            scaled_data.magnetic_field.T.unsqueeze(1),
             weight=integration_weight,
             stride=window_step,
         )
@@ -1086,7 +1086,7 @@ def _sliding_vertical_directions(
 
     for i in range(0, len(too_close_indices), batch_size):
         too_close_batch_indices = too_close_indices[i : i + batch_size]
-        too_close_field = windows[too_close_batch_indices, :3].transpose(1, 2)
+        too_close_field = windows.magnetic_field[too_close_batch_indices]
         too_close_mean_directions = avg_field_direction.index_select(
             0, too_close_batch_indices
         )
@@ -1221,20 +1221,6 @@ def _sliding_vertical_directions(
             possible_vertical_directions.gather(-2, index).squeeze(-2),
         )
     return vertical_directions
-
-
-def _get_sliding_windows(window_lengths, window_steps):
-    assert sorted(window_lengths) == sorted(set(window_lengths)), (
-        "window lengths must be unique"
-    )
-    assert len(window_lengths) == len(window_steps), (
-        "must have same number of window steps and lengths"
-    )
-
-    # use sliding windows sorted by longest window length to shortest
-    # because the algorithm gives preference to longer MFRs candidates over shorter ones
-    # since long MFRs tend to show up as a bunch of small MFRs (especially ICMEs)
-    return sorted(zip(window_lengths, window_steps), key=lambda x: x[0], reverse=True)
 
 
 def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
