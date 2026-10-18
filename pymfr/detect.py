@@ -322,6 +322,26 @@ def _detect_for_window_length(
     )
 
 
+def _calculate_smooth_angles(data, window_length):
+    magnetic_field = data["magnetic_field"]
+
+    kernel_size = max(window_length // 10, 1)
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # simple moving average
+    smoothed = F.avg_pool1d(
+        magnetic_field.T,
+        kernel_size=kernel_size,
+        padding=kernel_size // 2,
+        count_include_pad=False,
+        stride=1,
+    ).T
+
+    return (F.normalize(smoothed, dim=1) * F.normalize(magnetic_field)).sum(dim=1)
+
+
 def _downsample_and_window(
     original_timeseries,
     nominal_window_length,
@@ -439,293 +459,6 @@ def _downsample(field: torch.Tensor, kernel_size, scale_factor) -> torch.Tensor:
     return time_first.reshape(time_first.shape[0], *field.shape[1:])
 
 
-def _calculate_smooth_angles(data, window_length):
-    magnetic_field = data["magnetic_field"]
-
-    kernel_size = max(window_length // 10, 1)
-
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-
-    # simple moving average
-    smoothed = F.avg_pool1d(
-        magnetic_field.T,
-        kernel_size=kernel_size,
-        padding=kernel_size // 2,
-        count_include_pad=False,
-        stride=1,
-    ).T
-
-    return (F.normalize(smoothed, dim=1) * F.normalize(magnetic_field)).sum(dim=1)
-
-
-def _find_axes(
-    batch,
-    batch_data,
-    threshold_walen_slope,
-    threshold_flow_field_alignment,
-    threshold_diff,
-    n_trial_axes,
-):
-    batch_vertical_directions = batch["vertical_direction"]
-    batch_frames = batch["frame"]
-
-    # extract individual physical quantities
-    batch_magnetic_field = batch_data["magnetic_field"]
-    batch_gas_pressure = batch_data["gas_pressure"]
-
-    batch_normalized_potential = _calculate_normalized_potential(
-        batch_magnetic_field, batch_vertical_directions
-    )
-
-    batch_axes, axis_residue = _minimize_axis_residue(
-        batch_magnetic_field,
-        batch_vertical_directions,
-        batch_normalized_potential,
-        n_trial_axes,
-    )
-
-    axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
-
-    batch_velocity = batch_data["velocity"]
-
-    batch_density = batch_data["density"]
-
-    # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
-    # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
-    batch_alfven_velocity = (
-        batch_magnetic_field / torch.sqrt(batch_density.unsqueeze(-1))
-    ) * 21.8114
-    batch_alfven_velocity = torch.where(
-        batch_density[:, :, None] == 0, torch.inf, batch_alfven_velocity
-    )
-
-    walen_slope, flow_field_alignment = _calculate_walen_slope(
-        batch_frames, batch_alfven_velocity, batch_velocity
-    )
-    walen_slope_mask = torch.abs(walen_slope) <= threshold_walen_slope
-
-    if threshold_flow_field_alignment is not None:
-        walen_slope_mask = walen_slope_mask | (
-            (torch.abs(flow_field_alignment) >= threshold_flow_field_alignment)
-            & (torch.abs(walen_slope) < 0.9)
-        )
-
-    alpha = torch.where(
-        torch.abs(walen_slope) < threshold_walen_slope, 0, walen_slope**2
-    ).unsqueeze(1)
-
-    transverse_pressure = _calculate_transverse_pressure(
-        torch.linalg.norm(batch_magnetic_field, dim=-1),
-        axial_component,
-        batch_gas_pressure,
-        alpha,
-    )
-
-    error_diff = _calculate_residue_diff(
-        batch_normalized_potential, transverse_pressure
-    )
-    Bz_fluctuation = axial_component - axial_component.mean(dim=-1, keepdims=True)
-    pressure_fluctuation = transverse_pressure - transverse_pressure.mean(
-        dim=-1, keepdims=True
-    )
-    potential_fluctuation = (
-        batch_normalized_potential
-        - batch_normalized_potential.mean(dim=-1, keepdims=True)
-    )
-    Bz_sign = torch.sign(
-        (Bz_fluctuation * potential_fluctuation).sum(dim=-1)
-        / (potential_fluctuation**2).sum(dim=-1)
-    )
-    transverse_pressure_sign = torch.sign(
-        (pressure_fluctuation * potential_fluctuation).sum(dim=-1)
-        / (potential_fluctuation**2).sum(dim=-1)
-    )
-
-    # combine all the masks
-    mask = (
-        walen_slope_mask
-        & (axis_residue <= threshold_diff)
-        & (error_diff <= threshold_diff)
-        & (transverse_pressure_sign == 1)
-        & (Bz_sign == 1)
-    )
-
-    return mask, {
-        "axis": batch_axes,
-        "residue_diff": error_diff,
-        "walen_slope": walen_slope,
-        "flow_field_alignment": flow_field_alignment,
-    }
-
-
-def _calculate_transverse_pressure(B_magnitude, B_transverse, Pgas, alpha):
-    transverse_magnetic_pressure = (
-        (B_transverse * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
-    )
-    isotropic_magnetic_pressure = (
-        (B_magnitude * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
-    )
-    # calculate $p_t = B_z^2/2mu_0 + p/(1-alpha) + (alpha/(1-alpha)) B^2/2mu_0$
-    # since alpha is constant, no need for extra factor of (1 - alpha) used in Chen et al
-    # because \del^2 A' = \del^2 ((1 - alpha) A) = (1 - alpha) \del^2 A
-    # and dPt'/dA' = (1/(1-alpha))dPt'/dA
-    # also, \del^2 A = -\mu_0 j_z for any 2D field, field aligned flow or not,
-    # so \del^2 A version of Pt is more useful than the one for \del^2 A'
-    transverse_pressure = transverse_magnetic_pressure + (
-        Pgas + alpha * isotropic_magnetic_pressure
-    ) / (1 - alpha)
-    return transverse_pressure
-
-
-def _get_frame_quality_mask(batch, batch_data, threshold_frame_quality):
-    batch_frames = batch["frame"]
-    batch_magnetic_field = batch_data["magnetic_field"]
-    batch_velocity = batch_data["velocity"]
-    batch_electric_field = -torch.cross(batch_velocity, batch_magnetic_field, dim=-1)
-
-    frame_quality = _calculate_frame_quality(
-        batch_frames, batch_magnetic_field, batch_velocity, batch_electric_field
-    )
-    return frame_quality > threshold_frame_quality, {"frame_quality": frame_quality}
-
-
-def _validate_map(
-    batch,
-    batch_data,
-    nominal_window_length,
-    sample_spacing,
-    threshold_fit,
-):
-    batch_axes = batch["axis"]
-    batch_frames = batch["frame"]
-    batch_walen_slope = batch["walen_slope"]
-
-    reconstructed_map = _generate_map(
-        batch_data,
-        batch_axes,
-        batch_frames,
-        batch_walen_slope,
-        nominal_window_length,
-        sample_spacing,
-    )
-
-    y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
-
-    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
-
-    sign = torch.sign(
-        reconstructed_map.magnetic_potential[:, y_observed, :].mean(dim=1)
-    )
-
-    mask_fit = reconstructed_map.error_fit <= threshold_fit
-
-    closed_values = torch.abs(
-        torch.where(
-            reconstructed_map.core_mask,
-            reconstructed_map.magnetic_potential * sign[:, None, None],
-            torch.nan,
-        )
-    )
-    peak_closed = torch.nan_to_num(closed_values, -torch.inf).flatten(-2).max(dim=-1)
-    peak_observed_value = torch.nan_to_num(closed_values, -torch.inf)[
-        :, y_observed, :
-    ].amax(dim=-1)
-    minimum_closed = torch.nan_to_num(closed_values, torch.inf).flatten(-2).min(dim=-1)
-
-    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
-    width = torch.any(reconstructed_map.core_mask, dim=-2).to(float).sum(dim=-1)
-
-    closed_current_values = torch.abs(
-        torch.where(
-            reconstructed_map.core_mask,
-            reconstructed_map.current_density_z * sign[:, None, None],
-            torch.nan,
-        )
-    )
-    current_at_peak = (
-        closed_current_values.flatten(-2)
-        .gather(-1, peak_closed.indices.unsqueeze(-1))
-        .squeeze(-1)
-    )
-    current_at_minimum = (
-        closed_current_values.flatten(-2)
-        .gather(-1, minimum_closed.indices.unsqueeze(-1))
-        .squeeze(-1)
-    )
-    minimum_current = (
-        torch.nan_to_num(closed_current_values, torch.inf).flatten(-2).amin(dim=-1)
-    )
-    maximum_current = (
-        torch.nan_to_num(closed_current_values, -torch.inf).flatten(-2).amax(dim=-1)
-    )
-
-    mask_current = (current_at_minimum <= minimum_current) & (
-        current_at_peak >= maximum_current
-    )
-
-    mask_closed = (
-        (width >= 5) & (height >= 5) & (minimum_closed.values <= peak_observed_value)
-    )
-
-    mask_valid = ~torch.any(
-        (
-            torch.isnan(reconstructed_map.magnetic_potential)
-            | torch.isinf(reconstructed_map.magnetic_potential)
-        ).flatten(-2),
-        dim=-1,
-    )
-
-    return mask_fit & mask_valid & mask_current & mask_closed, {
-        "map_Az": reconstructed_map.magnetic_potential,
-        "map_Bx": reconstructed_map.magnetic_field_x,
-        "map_By": reconstructed_map.magnetic_field_y,
-        "map_Bz": reconstructed_map.magnetic_field_z,
-        "map_Jx": reconstructed_map.current_density_x,
-        "map_Jy": reconstructed_map.current_density_y,
-        "map_Jz": reconstructed_map.current_density_z,
-        "map_core_mask": reconstructed_map.core_mask,
-        "residue_fit": reconstructed_map.error_fit,
-    }
-
-
-def _generate_map(
-    data, axes, frames, walen_slope, nominal_window_length, sample_spacing
-):
-    batch_magnetic_field = data["magnetic_field"]
-    batch_gas_pressure = data["gas_pressure"]
-
-    alpha = walen_slope**2
-
-    time_elapsed = nominal_window_length * sample_spacing
-    dx_dt = torch.linalg.norm(
-        frames - (frames * axes).sum(dim=-1, keepdims=True) * axes, dim=-1
-    )
-
-    dt = time_elapsed / batch_magnetic_field.shape[-2]
-    dx = dx_dt * dt
-
-    x_axis = F.normalize(
-        -(frames - (frames * axes).sum(dim=-1, keepdim=True) * axes), dim=-1
-    )
-    y_axis = F.normalize(torch.cross(axes, x_axis, dim=-1), dim=-1)
-    basis = torch.stack([x_axis, y_axis, axes], dim=-1)
-
-    input_B = batch_magnetic_field @ basis
-
-    reconstructed_map = reconstruct_map(
-        input_B,
-        batch_gas_pressure,
-        alpha=alpha,
-        sample_spacing=dx,
-        poly_order=3,
-        resolution=MAP_RESOLUTION,
-        pad=0,
-    )
-
-    return reconstructed_map
-
-
 def _sliding_frames(data, window_length, window_step):
     magnetic_field = data["magnetic_field"]
     velocity = data["velocity"]
@@ -766,82 +499,6 @@ def _sliding_frames(data, window_length, window_step):
         ).solution.to(data.device)
 
     return frames
-
-
-def _calculate_frame_quality(frames, magnetic_field, velocity, electric_field):
-    electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
-
-    remaining_electric_field = -torch.cross(
-        velocity - frames.unsqueeze(1), magnetic_field, dim=2
-    )
-
-    frame_error = (remaining_electric_field**2).sum(dim=2).mean(dim=1) / (
-        electric_field**2
-    ).sum(dim=2).mean(dim=1)
-    frame_quality = torch.sqrt(1 - frame_error)
-
-    return frame_quality
-
-
-def _minimize_axis_residue(
-    magnetic_field, vertical_directions, potential, n_trial_axes, return_residue=True
-):
-    # use avg magnetic field as initial guess
-    initial_guess = magnetic_field.mean(dim=-2)
-    # ensure perpendicular to vertical direction
-    initial_guess = (
-        initial_guess
-        - (initial_guess * vertical_directions).sum(dim=-1, keepdims=True)
-        * vertical_directions
-    )
-    initial_axes = F.normalize(initial_guess, dim=-1)
-    # generate trial axes by rotating <B> around the vertical axis (we expect z to be <B> +- 90 degrees around y, since <Bz> should be positive)
-    alternative_directions = F.normalize(
-        torch.cross(vertical_directions, initial_axes, dim=-1), dim=-1
-    )
-    angle = torch.linspace(
-        -np.pi / 2, np.pi / 2, n_trial_axes, device=initial_axes.device
-    ).reshape(1, n_trial_axes, 1)
-    trial_axes = F.normalize(
-        initial_axes.unsqueeze(1) * torch.cos(angle)
-        + alternative_directions.unsqueeze(1) * torch.sin(angle),
-        dim=-1,
-    )
-
-    # For determining the axis we only use magnetic field data, not gas pressure
-    # This is because gas pressure error diff is not affected by rotations about the y axis
-    # unlike Bz, which depends on the axis orientation
-    # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
-    error_diff_axis = _calculate_residue_map(magnetic_field, trial_axes, potential)
-
-    # select the best orientation
-    residue, argmin = error_diff_axis.min(dim=-1)
-    index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
-    optimal_axes = trial_axes.gather(-2, index).squeeze(-2)
-
-    if return_residue:
-        return optimal_axes, residue
-    else:
-        return optimal_axes
-
-
-def _calculate_residue_map(magnetic_field, trial_axes, potential):
-    difference_vectors = torch.stack(
-        [
-            _calculate_folding_differences(potential, magnetic_field[:, :, i])
-            for i in range(3)
-        ],
-        dim=-1,
-    )
-
-    differences = torch.einsum("bsc,bkc->bsk", difference_vectors, trial_axes)
-    axial = torch.einsum("btc,bkc->btk", magnetic_field, trial_axes)
-
-    min_axial, max_axial = torch.aminmax(axial, dim=1)
-    axial_range = max_axial - min_axial
-    error_diff = torch.mean(differences**2, dim=1) ** 0.5 / axial_range
-
-    return error_diff
 
 
 def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_axes):
@@ -1001,28 +658,23 @@ def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_a
     }
 
 
-def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
-    remaining_flow = velocity - batch_frames.unsqueeze(1)
+def _calculate_normalized_potential(magnetic_field, vertical_directions):
+    # calculate the A array/magnetic flux function/potential using $A(x) = -\int_{x_0}^x B_y dx$
+    batch_magnetic_field_y = (
+        magnetic_field @ vertical_directions.unsqueeze(-1)
+    ).squeeze(-1)
+    unscaled_potential = torch.zeros(
+        batch_magnetic_field_y.shape, device=batch_magnetic_field_y.device
+    )
+    unscaled_potential[..., 1:] = torch.cumulative_trapezoid(batch_magnetic_field_y)
 
-    # simple linear regression slope with y intercept fixed at 0
-    walen_slope = (remaining_flow.flatten(1) * alfven_velocity.flatten(1)).sum(
-        dim=1
-    ) / (alfven_velocity.flatten(1) ** 2).sum(dim=1)
+    # use the potential peaks as the inflection points
+    inflection_points = unscaled_potential[..., 1:-1].abs().argmax(dim=-1) + 1
 
-    field_alignment = (
-        F.normalize(
-            remaining_flow.flatten(1)
-            - remaining_flow.flatten(1).mean(dim=1, keepdim=True),
-            dim=1,
-        )
-        * F.normalize(
-            alfven_velocity.flatten(1)
-            - alfven_velocity.flatten(1).mean(dim=1, keepdim=True),
-            dim=1,
-        )
-    ).sum(dim=1)
+    peak_values = unscaled_potential.gather(-1, inflection_points.unsqueeze(-1))
+    normalized_potential = unscaled_potential / peak_values
 
-    return walen_slope, field_alignment
+    return normalized_potential
 
 
 def _is_good_vertical_component(magnetic_field, vertical_directions):
@@ -1051,20 +703,368 @@ def _is_good_vertical_component(magnetic_field, vertical_directions):
     return single_stationary_point
 
 
-def _calculate_normalized_potential(magnetic_field, vertical_directions):
-    # calculate the A array/magnetic flux function/potential using $A(x) = -\int_{x_0}^x B_y dx$
-    batch_magnetic_field_y = (
-        magnetic_field @ vertical_directions.unsqueeze(-1)
-    ).squeeze(-1)
-    unscaled_potential = torch.zeros(
-        batch_magnetic_field_y.shape, device=batch_magnetic_field_y.device
+def _minimize_axis_residue(
+    magnetic_field, vertical_directions, potential, n_trial_axes, return_residue=True
+):
+    # use avg magnetic field as initial guess
+    initial_guess = magnetic_field.mean(dim=-2)
+    # ensure perpendicular to vertical direction
+    initial_guess = (
+        initial_guess
+        - (initial_guess * vertical_directions).sum(dim=-1, keepdims=True)
+        * vertical_directions
     )
-    unscaled_potential[..., 1:] = torch.cumulative_trapezoid(batch_magnetic_field_y)
+    initial_axes = F.normalize(initial_guess, dim=-1)
+    # generate trial axes by rotating <B> around the vertical axis (we expect z to be <B> +- 90 degrees around y, since <Bz> should be positive)
+    alternative_directions = F.normalize(
+        torch.cross(vertical_directions, initial_axes, dim=-1), dim=-1
+    )
+    angle = torch.linspace(
+        -np.pi / 2, np.pi / 2, n_trial_axes, device=initial_axes.device
+    ).reshape(1, n_trial_axes, 1)
+    trial_axes = F.normalize(
+        initial_axes.unsqueeze(1) * torch.cos(angle)
+        + alternative_directions.unsqueeze(1) * torch.sin(angle),
+        dim=-1,
+    )
 
-    # use the potential peaks as the inflection points
-    inflection_points = unscaled_potential[..., 1:-1].abs().argmax(dim=-1) + 1
+    # For determining the axis we only use magnetic field data, not gas pressure
+    # This is because gas pressure error diff is not affected by rotations about the y axis
+    # unlike Bz, which depends on the axis orientation
+    # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
+    error_diff_axis = _calculate_residue_map(magnetic_field, trial_axes, potential)
 
-    peak_values = unscaled_potential.gather(-1, inflection_points.unsqueeze(-1))
-    normalized_potential = unscaled_potential / peak_values
+    # select the best orientation
+    residue, argmin = error_diff_axis.min(dim=-1)
+    index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
+    optimal_axes = trial_axes.gather(-2, index).squeeze(-2)
 
-    return normalized_potential
+    if return_residue:
+        return optimal_axes, residue
+    else:
+        return optimal_axes
+
+
+def _calculate_residue_map(magnetic_field, trial_axes, potential):
+    difference_vectors = torch.stack(
+        [
+            _calculate_folding_differences(potential, magnetic_field[:, :, i])
+            for i in range(3)
+        ],
+        dim=-1,
+    )
+
+    differences = torch.einsum("bsc,bkc->bsk", difference_vectors, trial_axes)
+    axial = torch.einsum("btc,bkc->btk", magnetic_field, trial_axes)
+
+    min_axial, max_axial = torch.aminmax(axial, dim=1)
+    axial_range = max_axial - min_axial
+    error_diff = torch.mean(differences**2, dim=1) ** 0.5 / axial_range
+
+    return error_diff
+
+
+def _get_frame_quality_mask(batch, batch_data, threshold_frame_quality):
+    batch_frames = batch["frame"]
+    batch_magnetic_field = batch_data["magnetic_field"]
+    batch_velocity = batch_data["velocity"]
+    batch_electric_field = -torch.cross(batch_velocity, batch_magnetic_field, dim=-1)
+
+    frame_quality = _calculate_frame_quality(
+        batch_frames, batch_magnetic_field, batch_velocity, batch_electric_field
+    )
+    return frame_quality > threshold_frame_quality, {"frame_quality": frame_quality}
+
+
+def _calculate_frame_quality(frames, magnetic_field, velocity, electric_field):
+    electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
+
+    remaining_electric_field = -torch.cross(
+        velocity - frames.unsqueeze(1), magnetic_field, dim=2
+    )
+
+    frame_error = (remaining_electric_field**2).sum(dim=2).mean(dim=1) / (
+        electric_field**2
+    ).sum(dim=2).mean(dim=1)
+    frame_quality = torch.sqrt(1 - frame_error)
+
+    return frame_quality
+
+
+def _find_axes(
+    batch,
+    batch_data,
+    threshold_walen_slope,
+    threshold_flow_field_alignment,
+    threshold_diff,
+    n_trial_axes,
+):
+    batch_vertical_directions = batch["vertical_direction"]
+    batch_frames = batch["frame"]
+
+    # extract individual physical quantities
+    batch_magnetic_field = batch_data["magnetic_field"]
+    batch_gas_pressure = batch_data["gas_pressure"]
+
+    batch_normalized_potential = _calculate_normalized_potential(
+        batch_magnetic_field, batch_vertical_directions
+    )
+
+    batch_axes, axis_residue = _minimize_axis_residue(
+        batch_magnetic_field,
+        batch_vertical_directions,
+        batch_normalized_potential,
+        n_trial_axes,
+    )
+
+    axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
+
+    batch_velocity = batch_data["velocity"]
+
+    batch_density = batch_data["density"]
+
+    # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
+    # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
+    batch_alfven_velocity = (
+        batch_magnetic_field / torch.sqrt(batch_density.unsqueeze(-1))
+    ) * 21.8114
+    batch_alfven_velocity = torch.where(
+        batch_density[:, :, None] == 0, torch.inf, batch_alfven_velocity
+    )
+
+    walen_slope, flow_field_alignment = _calculate_walen_slope(
+        batch_frames, batch_alfven_velocity, batch_velocity
+    )
+    walen_slope_mask = torch.abs(walen_slope) <= threshold_walen_slope
+
+    if threshold_flow_field_alignment is not None:
+        walen_slope_mask = walen_slope_mask | (
+            (torch.abs(flow_field_alignment) >= threshold_flow_field_alignment)
+            & (torch.abs(walen_slope) < 0.9)
+        )
+
+    alpha = torch.where(
+        torch.abs(walen_slope) < threshold_walen_slope, 0, walen_slope**2
+    ).unsqueeze(1)
+
+    transverse_pressure = _calculate_transverse_pressure(
+        torch.linalg.norm(batch_magnetic_field, dim=-1),
+        axial_component,
+        batch_gas_pressure,
+        alpha,
+    )
+
+    error_diff = _calculate_residue_diff(
+        batch_normalized_potential, transverse_pressure
+    )
+    Bz_fluctuation = axial_component - axial_component.mean(dim=-1, keepdims=True)
+    pressure_fluctuation = transverse_pressure - transverse_pressure.mean(
+        dim=-1, keepdims=True
+    )
+    potential_fluctuation = (
+        batch_normalized_potential
+        - batch_normalized_potential.mean(dim=-1, keepdims=True)
+    )
+    Bz_sign = torch.sign(
+        (Bz_fluctuation * potential_fluctuation).sum(dim=-1)
+        / (potential_fluctuation**2).sum(dim=-1)
+    )
+    transverse_pressure_sign = torch.sign(
+        (pressure_fluctuation * potential_fluctuation).sum(dim=-1)
+        / (potential_fluctuation**2).sum(dim=-1)
+    )
+
+    # combine all the masks
+    mask = (
+        walen_slope_mask
+        & (axis_residue <= threshold_diff)
+        & (error_diff <= threshold_diff)
+        & (transverse_pressure_sign == 1)
+        & (Bz_sign == 1)
+    )
+
+    return mask, {
+        "axis": batch_axes,
+        "residue_diff": error_diff,
+        "walen_slope": walen_slope,
+        "flow_field_alignment": flow_field_alignment,
+    }
+
+
+def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
+    remaining_flow = velocity - batch_frames.unsqueeze(1)
+
+    # simple linear regression slope with y intercept fixed at 0
+    walen_slope = (remaining_flow.flatten(1) * alfven_velocity.flatten(1)).sum(
+        dim=1
+    ) / (alfven_velocity.flatten(1) ** 2).sum(dim=1)
+
+    field_alignment = (
+        F.normalize(
+            remaining_flow.flatten(1)
+            - remaining_flow.flatten(1).mean(dim=1, keepdim=True),
+            dim=1,
+        )
+        * F.normalize(
+            alfven_velocity.flatten(1)
+            - alfven_velocity.flatten(1).mean(dim=1, keepdim=True),
+            dim=1,
+        )
+    ).sum(dim=1)
+
+    return walen_slope, field_alignment
+
+
+def _calculate_transverse_pressure(B_magnitude, B_transverse, Pgas, alpha):
+    transverse_magnetic_pressure = (
+        (B_transverse * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
+    )
+    isotropic_magnetic_pressure = (
+        (B_magnitude * 1e-9) ** 2 / (2 * 1.25663706212e-6) * 1e9
+    )
+    # calculate $p_t = B_z^2/2mu_0 + p/(1-alpha) + (alpha/(1-alpha)) B^2/2mu_0$
+    # since alpha is constant, no need for extra factor of (1 - alpha) used in Chen et al
+    # because \del^2 A' = \del^2 ((1 - alpha) A) = (1 - alpha) \del^2 A
+    # and dPt'/dA' = (1/(1-alpha))dPt'/dA
+    # also, \del^2 A = -\mu_0 j_z for any 2D field, field aligned flow or not,
+    # so \del^2 A version of Pt is more useful than the one for \del^2 A'
+    transverse_pressure = transverse_magnetic_pressure + (
+        Pgas + alpha * isotropic_magnetic_pressure
+    ) / (1 - alpha)
+    return transverse_pressure
+
+
+def _validate_map(
+    batch,
+    batch_data,
+    nominal_window_length,
+    sample_spacing,
+    threshold_fit,
+):
+    batch_axes = batch["axis"]
+    batch_frames = batch["frame"]
+    batch_walen_slope = batch["walen_slope"]
+
+    reconstructed_map = _generate_map(
+        batch_data,
+        batch_axes,
+        batch_frames,
+        batch_walen_slope,
+        nominal_window_length,
+        sample_spacing,
+    )
+
+    y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
+
+    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
+
+    sign = torch.sign(
+        reconstructed_map.magnetic_potential[:, y_observed, :].mean(dim=1)
+    )
+
+    mask_fit = reconstructed_map.error_fit <= threshold_fit
+
+    closed_values = torch.abs(
+        torch.where(
+            reconstructed_map.core_mask,
+            reconstructed_map.magnetic_potential * sign[:, None, None],
+            torch.nan,
+        )
+    )
+    peak_closed = torch.nan_to_num(closed_values, -torch.inf).flatten(-2).max(dim=-1)
+    peak_observed_value = torch.nan_to_num(closed_values, -torch.inf)[
+        :, y_observed, :
+    ].amax(dim=-1)
+    minimum_closed = torch.nan_to_num(closed_values, torch.inf).flatten(-2).min(dim=-1)
+
+    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
+    width = torch.any(reconstructed_map.core_mask, dim=-2).to(float).sum(dim=-1)
+
+    closed_current_values = torch.abs(
+        torch.where(
+            reconstructed_map.core_mask,
+            reconstructed_map.current_density_z * sign[:, None, None],
+            torch.nan,
+        )
+    )
+    current_at_peak = (
+        closed_current_values.flatten(-2)
+        .gather(-1, peak_closed.indices.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    current_at_minimum = (
+        closed_current_values.flatten(-2)
+        .gather(-1, minimum_closed.indices.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    minimum_current = (
+        torch.nan_to_num(closed_current_values, torch.inf).flatten(-2).amin(dim=-1)
+    )
+    maximum_current = (
+        torch.nan_to_num(closed_current_values, -torch.inf).flatten(-2).amax(dim=-1)
+    )
+
+    mask_current = (current_at_minimum <= minimum_current) & (
+        current_at_peak >= maximum_current
+    )
+
+    mask_closed = (
+        (width >= 5) & (height >= 5) & (minimum_closed.values <= peak_observed_value)
+    )
+
+    mask_valid = ~torch.any(
+        (
+            torch.isnan(reconstructed_map.magnetic_potential)
+            | torch.isinf(reconstructed_map.magnetic_potential)
+        ).flatten(-2),
+        dim=-1,
+    )
+
+    return mask_fit & mask_valid & mask_current & mask_closed, {
+        "map_Az": reconstructed_map.magnetic_potential,
+        "map_Bx": reconstructed_map.magnetic_field_x,
+        "map_By": reconstructed_map.magnetic_field_y,
+        "map_Bz": reconstructed_map.magnetic_field_z,
+        "map_Jx": reconstructed_map.current_density_x,
+        "map_Jy": reconstructed_map.current_density_y,
+        "map_Jz": reconstructed_map.current_density_z,
+        "map_core_mask": reconstructed_map.core_mask,
+        "residue_fit": reconstructed_map.error_fit,
+    }
+
+
+def _generate_map(
+    data, axes, frames, walen_slope, nominal_window_length, sample_spacing
+):
+    batch_magnetic_field = data["magnetic_field"]
+    batch_gas_pressure = data["gas_pressure"]
+
+    alpha = walen_slope**2
+
+    time_elapsed = nominal_window_length * sample_spacing
+    dx_dt = torch.linalg.norm(
+        frames - (frames * axes).sum(dim=-1, keepdims=True) * axes, dim=-1
+    )
+
+    dt = time_elapsed / batch_magnetic_field.shape[-2]
+    dx = dx_dt * dt
+
+    x_axis = F.normalize(
+        -(frames - (frames * axes).sum(dim=-1, keepdim=True) * axes), dim=-1
+    )
+    y_axis = F.normalize(torch.cross(axes, x_axis, dim=-1), dim=-1)
+    basis = torch.stack([x_axis, y_axis, axes], dim=-1)
+
+    input_B = batch_magnetic_field @ basis
+
+    reconstructed_map = reconstruct_map(
+        input_B,
+        batch_gas_pressure,
+        alpha=alpha,
+        sample_spacing=dx,
+        poly_order=3,
+        resolution=MAP_RESOLUTION,
+        pad=0,
+    )
+
+    return reconstructed_map
