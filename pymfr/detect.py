@@ -474,17 +474,6 @@ def _batch_process(
         if torch.any(contains_existing[start : start + nominal_window_length]):
             window_mask[i] = False
             continue
-
-        # full_window_data = full_tensor[window_starts[i]:window_starts[i] + nominal_window_length]
-
-        # reference_B = full_window_data[:, :3]
-        # x_axis = F.normalize(-(window_frames[i] - (window_frames[i] * window_axes[i]).sum(dim=-1, keepdim=True) * window_axes[i]), dim=-1)
-        # y_axis = F.normalize(torch.cross(window_axes[i], x_axis, dim=-1), dim=-1)
-        # basis = torch.stack([x_axis, y_axis, window_axes[i]], dim=-1)
-        # reference_B = reference_B @ basis
-        # model_B = torch.column_stack([component[i][MAP_RESOLUTION // 2, :] for component in [window_map_Bx, window_map_By, window_map_Bz]])
-        # interpolated_B = F.interpolate(model_B.T.unsqueeze(0), nominal_window_length, mode="linear", align_corners=True).squeeze(0).T
-
         contains_existing[start : start + nominal_window_length] = True
 
     if ~torch.any(window_mask):
