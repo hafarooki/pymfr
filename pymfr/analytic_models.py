@@ -14,15 +14,15 @@ def gold_hoyle(x, y, B0, T0):
         Bphi = B0 * T0 * r / (1 + T0**2 * r**2)
         angle = np.arctan2(y, x)
         Bx = -np.sin(angle) * Bphi
-        Bx = np.cos(angle) * Bphi
+        By = np.cos(angle) * Bphi
         Bz = B0 / (1 + T0**2 * r**2)
 
     In Cartesian coordinates, sin(angle) = y/r and cos(angle) = x/r, so this
     simplifies to:
         denom = 1 + T0**2 * (x**2 + y**2)
-        Bz = B0 / denom
         Bx = -B0 * T0 * y / denom
         By = B0 * T0 * x / denom
+        Bz = B0 / denom
 
     Returns (Bx, By, Bz).
     """
