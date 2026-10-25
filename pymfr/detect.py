@@ -2,50 +2,20 @@ import math
 from functools import partial
 
 import numpy as np
-import pandera.xarray as pa
 import torch
 import torch.nn.functional as F
 import tqdm
 import xarray
-from pandera.typing.xarray import Dataset
 from tensordict import TensorDict
 
+from pymfr.gradients import minrmsdd
 from pymfr.reconstruct import reconstruct_map
 from pymfr.residue import (
     _calculate_folding_differences,
     _calculate_residue_diff,
 )
 
-MAP_RESOLUTION = 11
 
-
-class DetectedFluxRopes(pa.DatasetModel):
-    window_start: np.int64 = pa.Field(dims=("event",))
-    window_length: np.int64 = pa.Field(dims=("event",))
-    temporal_scale: np.float32 = pa.Field(dims=("event",))
-    spatial_scale: np.float32 = pa.Field(dims=("event",))
-    residue_diff: np.float32 = pa.Field(dims=("event",))
-    residue_fit: np.float32 = pa.Field(dims=("event",))
-    walen_slope: np.float32 = pa.Field(dims=("event",))
-    frame_quality: np.float32 = pa.Field(dims=("event",))
-    flow_field_alignment: np.float32 = pa.Field(dims=("event",))
-    axis_x: np.float32 = pa.Field(dims=("event",))
-    axis_y: np.float32 = pa.Field(dims=("event",))
-    axis_z: np.float32 = pa.Field(dims=("event",))
-    velocity_x: np.float32 = pa.Field(dims=("event",))
-    velocity_y: np.float32 = pa.Field(dims=("event",))
-    velocity_z: np.float32 = pa.Field(dims=("event",))
-    map_Az: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_Bx: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_By: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_Bz: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_Jx: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_Jy: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_Jz: np.float32 = pa.Field(dims=("event", "y", "x"))
-    map_core_mask: bool = pa.Field(dims=("event", "y", "x"))
-
-
-@pa.check_types
 def detect_flux_ropes(
     magnetic_field,
     velocity,
@@ -55,6 +25,7 @@ def detect_flux_ropes(
     window_lengths,
     window_steps,
     sample_spacing,
+    magnetic_field_gradient=None,
     threshold_frame_quality=0.95,
     threshold_diff=0.3,
     threshold_fit=0.3,
@@ -62,39 +33,82 @@ def detect_flux_ropes(
     threshold_flow_field_alignment=0.8,
     n_trial_axes=256,
     max_processing_resolution=32,
+    map_resolution=11,
     cuda=None,
     progress_bar=True,
-) -> Dataset[DetectedFluxRopes]:
+) -> xarray.Dataset:
     """
     MFR detection based on the Grad-Shafranov automated detection algorithm.
 
-    References:
-    Q. Hu, J. Zheng, Y. Chen, J. le Roux and L. Zhao, 2018,
-    Automated detection of small-scale magnetic flux ropes in the solar wind:
-    First results from the Wind spacecraft measurements, Astrophys. J. Supp., 239, 12,
-    http://iopscience.iop.org/article/10.3847/1538-4365/aae57d
+    Parameters
+    ----------
+    magnetic_field : array_like, shape (N, 3)
+        Magnetic field vectors in nT.
+    velocity : array_like, shape (N, 3)
+        Proton velocity vectors in km/s.
+    density : array_like, shape (N,)
+        Proton number density in cm^-3.
+    gas_pressure : array_like, shape (N,)
+        Plasma pressure in nPa.
+    batch_size : int
+        Number of windows to process per batch.
+    window_lengths : sequence of int
+        A range of sliding window sizes.
+    window_steps : sequence of int
+        A range of sliding window strides.
+    sample_spacing : float
+        Spacing between samples in seconds.
+    magnetic_field_gradient : array_like, shape (N, 3, 3), optional
+        Magnetic field gradient tensors in nT/km. If not given, the output
+        ``minrmsdd`` is NaN.
+    threshold_frame_quality : float, default 0.95
+        Minimum correlation coefficient for the HT frame (Khabrov and Sonnerup,
+        1998).
+    threshold_diff : float, default 0.3
+        The maximum allowable R_diff.
+    threshold_fit : float, default 0.3
+        The maximum allowable R_fit.
+    threshold_walen_slope : float, default 0.3
+        The threshold for <M_A> (calculated using Walen slope) to determine if the
+        remaining flow is significant.
+    threshold_flow_field_alignment : float or None, default 0.8
+        The threshold for the correlation between v and v_A (validates that v is
+        field aligned with constant M_A). If flux ropes with field aligned flows are
+        not desired, then set to None.
+    n_trial_axes : int, default 256
+        The number of evenly spaced guess orientations used for the axis
+        determination algorithm. Odd number is desirable so that one of the trial
+        axes includes the previous iteration's best orientation (starting with avg
+        field direction).
+    max_processing_resolution : int or None, default 32
+        Scale sliding window data down to approximately this size (if larger)
+        before generating sliding windows to reduce memory usage. If None, windows
+        are processed at full resolution.
+    map_resolution : int, default 11
+        Width and height in pixels of the reconstructed cross section maps.
+        This determines the resolution used for GS reconstruction and the size
+        of the ``y`` and ``x`` dims of the output ``map_*`` variables.
+        It is recommended to leave this at its default value, which was chosen
+        carefully after extensive analysis of many example events.
+        A value too low would have too little detail and excessive smoothing,
+        whereas a value too high can result in an unstable and meaningless reconstruction.
+    cuda : bool or None, default None
+        Whether to use the GPU. None uses the GPU only if available.
+    progress_bar : bool, default True
+        Whether to show a progress bar over window lengths.
 
-    :param magnetic_field: Magnetic field vectors in nT, shape (N, 3).
-    :param velocity: Proton velocity vectors in km/s, shape (N, 3).
-    :param density: Proton number density in cm^-3, shape (N,).
-    :param gas_pressure: Plasma pressure in nPa, shape (N,).
-    :param batch_size: Number of windows to process per batch.
-    :param window_lengths: A range of sliding window sizes.
-    :param window_steps: A range of sliding window strides.
-    :param sample_spacing: Spacing between samples in seconds.
-    :param threshold_frame_quality: Minimum correlation coefficient for the HT frame (Khabrov and Sonnerup, 1998).
-    :param threshold_diff: The maximum allowable R_diff
-    :param threshold_fit: The maximum allowable R_fit
-    :param threshold_walen_slope: The threshold for <M_A> (calculated using Walen slope) to determine if the remaining flow is significant.
-    :param threshold_flow_field_alignment: The threshold for the correlation between v and v_A
-    (validates that v is field aligned with constant M_A).
-    If flux ropes with field aligned flows are not desired, then set to None.
-    Default 0.8.
-    :param n_trial_axes: The number of evenly spaced guess orientations used for the axis determination algorithm.
-    Odd number is desirable so that one of the trial axes includes the previous iteration's best orientation (starting with avg field direction).
-    :param max_processing_resolution: Scale sliding window data down to approximately this size (if larger) before generating sliding windows to reduce memory usage. Default 32. If None, windows are processed at full resolution.
-    :param cuda: Whether to use the GPU. Default None uses the GPU only if available.
-    :return: A ``DetectedFluxRopes`` dataset describing the detected flux ropes (empty along ``event`` if none were found).
+    Returns
+    -------
+    xarray.Dataset
+        Properties of the detected flux ropes, one entry along ``event`` each
+        (zero entries if none were found). See the attributes for more details.
+
+    References
+    ----------
+    Q. Hu, J. Zheng, Y. Chen, J. le Roux and L. Zhao, 2018, Automated detection of
+    small-scale magnetic flux ropes in the solar wind: First results from the Wind
+    spacecraft measurements, Astrophys. J. Supp., 239, 12,
+    http://iopscience.iop.org/article/10.3847/1538-4365/aae57d
     """
 
     if cuda is None:
@@ -114,6 +128,11 @@ def detect_flux_ropes(
     assert data["velocity"].shape == data["magnetic_field"].shape
     assert data["density"].shape == data.batch_size
     assert data["gas_pressure"].shape == data.batch_size
+    if magnetic_field_gradient is not None:
+        data["magnetic_field_gradient"] = torch.as_tensor(
+            magnetic_field_gradient, device=data.device, dtype=data.dtype
+        )
+        assert data["magnetic_field_gradient"].shape == data.batch_size + (3, 3)
 
     assert not any(torch.isnan(field).any() for field in data.values()), (
         "Data contains missing values (nan). PyMFR does not automatically handle missing values. Instead, please keep track of which data points contain nans beforehand, interpolate or fill, and then remove flux ropes with intervals containing too many NaNs."
@@ -153,26 +172,10 @@ def detect_flux_ropes(
             threshold_flow_field_alignment=threshold_flow_field_alignment,
             n_trial_axes=n_trial_axes,
             max_processing_resolution=max_processing_resolution,
+            map_resolution=map_resolution,
         )
-
-        if output is None:
-            continue
 
         output_datasets.append(output)
-
-    if len(output_datasets) == 0:
-        return xarray.Dataset(
-            data_vars={
-                name: (
-                    field.dims,
-                    np.zeros(
-                        (0,) + (MAP_RESOLUTION,) * (len(field.dims) - 1),
-                        dtype=field.dtype,
-                    ),
-                )
-                for name, field in DetectedFluxRopes.to_schema().data_vars.items()
-            }
-        )
 
     return xarray.concat(output_datasets, dim="event")
 
@@ -191,12 +194,9 @@ def _detect_for_window_length(
     threshold_flow_field_alignment,
     n_trial_axes,
     max_processing_resolution,
+    map_resolution,
 ):
-    """
-    detect flux ropes using sliding windows of a single nominal length. marks the
-    samples covered by newly detected flux ropes in contains_existing (in place).
-    returns None if none were found
-    """
+    # detect flux ropes using sliding windows of a single nominal length
     # bundle these together so they can be downsampled and windowed together
     original_timeseries = TensorDict(
         data=data,
@@ -262,15 +262,15 @@ def _detect_for_window_length(
             nominal_window_length=nominal_window_length,
             sample_spacing=sample_spacing,
             threshold_fit=threshold_fit,
+            map_resolution=map_resolution,
         ),
     ]
     for stage in stages:
-        if len(remaining_sliding_windows) == 0:
-            return None
-
         passed = []
         for batch in remaining_sliding_windows.split(batch_size):
-            mask, results = stage(batch, windows["samples", "data"][batch["window_index"]])
+            mask, results = stage(
+                batch, windows["samples", "data"][batch["window_index"]]
+            )
             batch.update(results)
             passed.append(batch[mask])
         remaining_sliding_windows = torch.cat(passed)
@@ -289,9 +289,6 @@ def _detect_for_window_length(
 
     remaining_sliding_windows = remaining_sliding_windows[is_new]
 
-    if len(remaining_sliding_windows) == 0:
-        return None
-
     temporal_scale = (
         torch.ones_like(remaining_sliding_windows["window_start"], dtype=torch.float32)
         * nominal_window_length
@@ -299,6 +296,7 @@ def _detect_for_window_length(
     )
     frames = remaining_sliding_windows["frame"]
     axes = remaining_sliding_windows["axis"]
+
     dx_dt = torch.linalg.norm(
         frames - (frames * axes).sum(dim=-1, keepdims=True) * axes,
         dim=-1,
@@ -309,16 +307,152 @@ def _detect_for_window_length(
     remaining_sliding_windows["temporal_scale"] = temporal_scale
     remaining_sliding_windows["spatial_scale"] = dx_dt * temporal_scale
 
-    # TODO use a coord instead of separate variables
-    for i, component in enumerate("xyz"):
-        remaining_sliding_windows[f"axis_{component}"] = axes[:, i]
-        remaining_sliding_windows[f"velocity_{component}"] = frames[:, i]
+    return _to_dataset(remaining_sliding_windows)
+
+
+def _to_dataset(windows):
+    # convert the detected windows, a TensorDict with batch size (event,), into
+    # the output dataset of detect_flux_ropes
+    data = windows.cpu().numpy()
+    data["velocity"] = data["frame"]
+
+    variables = {
+        "window_start": (
+            ["event"],
+            {
+                "long_name": "Window start",
+                "comment": "Index of the window's first sample in the input data",
+            },
+        ),
+        "window_length": (
+            ["event"],
+            {
+                "long_name": "Window length",
+                "comment": "Approximate number of samples used from the input data",
+            },
+        ),
+        "temporal_scale": (
+            ["event"],
+            {
+                "long_name": "Duration",
+                "comment": "Window duration",
+                "units": "s",
+            },
+        ),
+        "spatial_scale": (
+            ["event"],
+            {
+                "long_name": "Size",
+                "comment": "Distance traversed across the cross section",
+                "units": "km",
+            },
+        ),
+        "residue_diff": (
+            ["event"],
+            {
+                "long_name": "R_diff",
+                "comment": "RMS difference of the transverse pressure between "
+                "the two branches of P_t(A), normalized by the range of P_t",
+                "units": "1",
+            },
+        ),
+        "residue_fit": (
+            ["event"],
+            {
+                "long_name": "R_fit",
+                "comment": "RMS residual of the polynomial fit of P_t(A) used for "
+                "the reconstructed map, normalized by the range of the fit",
+                "units": "1",
+            },
+        ),
+        "walen_slope": (
+            ["event"],
+            {
+                "long_name": "Walen slope",
+                "comment": "Walen slope of the remaining flow in the HT frame",
+                "units": "1",
+            },
+        ),
+        "frame_quality": (
+            ["event"],
+            {
+                "long_name": "HT frame quality",
+                "comment": "HT frame correlation coefficient",
+                "units": "1",
+            },
+        ),
+        "flow_field_alignment": (
+            ["event"],
+            {
+                "long_name": "Flow-field alignment",
+                "comment": "Correlation between the HT-frame velocity and the "
+                "magnetic field in Alfven units",
+                "units": "1",
+            },
+        ),
+        "axis": (
+            ["event", "component"],
+            {
+                "long_name": "Axis",
+                "comment": "Flux rope axis unit vector, in input coordinates",
+                "units": "1",
+            },
+        ),
+        "velocity": (
+            ["event", "component"],
+            {
+                "long_name": "HT frame velocity",
+                "comment": "HT frame velocity, in input coordinates",
+                "units": "km/s",
+            },
+        ),
+        "minrmsdd": (
+            ["event", "component"],
+            {
+                "long_name": "MinRMSDD direction",
+                "comment": "Minimum root-mean-square directional derivative "
+                "unit vector, in input coordinates",
+                "units": "1",
+            },
+        ),
+        "map_Az": (
+            ["event", "y", "x"],
+            {
+                "long_name": "A_z",
+                "comment": "Magnetic flux function",
+                "units": "nT km",
+            },
+        ),
+        "map_B": (
+            ["event", "y", "x", "component"],
+            {
+                "long_name": "B",
+                "comment": "Magnetic field, in flux rope frame",
+                "units": "nT",
+            },
+        ),
+        "map_J": (
+            ["event", "y", "x", "component"],
+            {
+                "long_name": "J",
+                "comment": "Current density, in flux rope frame",
+                "units": "pA/m^2",
+            },
+        ),
+        "map_core_mask": (
+            ["event", "y", "x"],
+            {
+                "long_name": "is_core",
+                "comment": "Whether the pixel is inside the flux rope core "
+                "(closed field lines)",
+            },
+        ),
+    }
 
     return xarray.Dataset(
         data_vars={
-            name: (field.dims, remaining_sliding_windows[name].cpu().numpy())
-            for name, field in DetectedFluxRopes.to_schema().data_vars.items()
-        }
+            name: (dims, data[name], attrs) for name, (dims, attrs) in variables.items()
+        },
     )
 
 
@@ -410,7 +544,8 @@ def _downsample_and_window(
     # full-resolution sample indices
     window_starts = (
         torch.arange(n_window, device=downsampled_timeseries.device)
-        * window_step * downsample_factor
+        * window_step
+        * downsample_factor
     ).to(int)
 
     # generate the sliding windows as a tensor view, which is only actually loaded into memory when copied on demand
@@ -509,13 +644,18 @@ def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_a
     batch_magnetic_field = batch_data["magnetic_field"]
     window_frames = batch["frame"]
 
+    if len(batch) == 0:
+        # avg_pool1d rejects an empty batch, so return empty results
+        return torch.zeros(0, dtype=torch.bool, device=batch.device), {
+            "vertical_direction": torch.zeros_like(window_frames)
+        }
+
     window_avg_field_strength = torch.norm(batch_magnetic_field, dim=-1).mean(dim=-1)
 
     # trapezoid-integral mean of each window's field
     # L samples -> L - 1 gaps
-    window_avg_field = (
-        torch.trapezoid(batch_magnetic_field, dim=-2)
-        / (batch_magnetic_field.shape[-2] - 1)
+    window_avg_field = torch.trapezoid(batch_magnetic_field, dim=-2) / (
+        batch_magnetic_field.shape[-2] - 1
     )
 
     avg_field_direction = F.normalize(window_avg_field, dim=-1)
@@ -799,41 +939,24 @@ def _find_axes(
     threshold_diff,
     n_trial_axes,
 ):
-    batch_vertical_directions = batch["vertical_direction"]
-    batch_frames = batch["frame"]
-
-    # extract individual physical quantities
-    batch_magnetic_field = batch_data["magnetic_field"]
-    batch_gas_pressure = batch_data["gas_pressure"]
-
     batch_normalized_potential = _calculate_normalized_potential(
-        batch_magnetic_field, batch_vertical_directions
+        batch_data["magnetic_field"], batch["vertical_direction"]
     )
 
     batch_axes, axis_residue = _minimize_axis_residue(
-        batch_magnetic_field,
-        batch_vertical_directions,
+        batch_data["magnetic_field"],
+        batch["vertical_direction"],
         batch_normalized_potential,
         n_trial_axes,
     )
 
-    axial_component = (batch_magnetic_field @ batch_axes.unsqueeze(-1)).squeeze(-1)
-
-    batch_velocity = batch_data["velocity"]
-
-    batch_density = batch_data["density"]
-
-    # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
-    # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
-    batch_alfven_velocity = (
-        batch_magnetic_field / torch.sqrt(batch_density.unsqueeze(-1))
-    ) * 21.8114
-    batch_alfven_velocity = torch.where(
-        batch_density[:, :, None] == 0, torch.inf, batch_alfven_velocity
-    )
+    axial_component = (batch_data["magnetic_field"] * batch_axes[:, None]).sum(-1)
 
     walen_slope, flow_field_alignment = _calculate_walen_slope(
-        batch_frames, batch_alfven_velocity, batch_velocity
+        batch["frame"],
+        batch_data["magnetic_field"],
+        batch_data["density"],
+        batch_data["velocity"],
     )
     walen_slope_mask = torch.abs(walen_slope) <= threshold_walen_slope
 
@@ -848,9 +971,9 @@ def _find_axes(
     ).unsqueeze(1)
 
     transverse_pressure = _calculate_transverse_pressure(
-        torch.linalg.norm(batch_magnetic_field, dim=-1),
+        torch.linalg.norm(batch_data["magnetic_field"], dim=-1),
         axial_component,
-        batch_gas_pressure,
+        batch_data["gas_pressure"],
         alpha,
     )
 
@@ -883,15 +1006,26 @@ def _find_axes(
         & (Bz_sign == 1)
     )
 
+    if "magnetic_field_gradient" in batch_data.keys():  # noqa: SIM118
+        batch_minrmsdd = minrmsdd(batch_data["magnetic_field_gradient"])
+    else:
+        batch_minrmsdd = torch.full_like(batch_axes, torch.nan)
+
     return mask, {
         "axis": batch_axes,
+        "minrmsdd": batch_minrmsdd,
         "residue_diff": error_diff,
         "walen_slope": walen_slope,
         "flow_field_alignment": flow_field_alignment,
     }
 
 
-def _calculate_walen_slope(batch_frames, alfven_velocity, velocity):
+def _calculate_walen_slope(batch_frames, magnetic_field, density, velocity):
+    # alfven velocity is calculated based on v_A = |B|/sqrt(n_p m_p mu_0)
+    # constant factor 21.8114 assumes B in nT, n_p in cm^-3, v_A in km/s
+    alfven_velocity = (magnetic_field / torch.sqrt(density.unsqueeze(-1))) * 21.8114
+    alfven_velocity = torch.where(density[:, :, None] == 0, torch.inf, alfven_velocity)
+
     remaining_flow = velocity - batch_frames.unsqueeze(1)
 
     # simple linear regression slope with y intercept fixed at 0
@@ -940,7 +1074,24 @@ def _validate_map(
     nominal_window_length,
     sample_spacing,
     threshold_fit,
+    map_resolution,
 ):
+    if len(batch) == 0:
+        # the reconstruction can't handle an empty batch, so explicitly define the empty-case result
+        empty_map = torch.zeros(
+            (0, map_resolution, map_resolution), device=batch.device
+        )
+        empty_vector_map = torch.zeros(
+            (0, map_resolution, map_resolution, 3), device=batch.device
+        )
+        return torch.zeros(0, dtype=torch.bool, device=batch.device), {
+            "map_Az": empty_map,
+            "map_B": empty_vector_map,
+            "map_J": empty_vector_map,
+            "map_core_mask": empty_map.to(torch.bool),
+            "residue_fit": torch.zeros(0, device=batch.device),
+        }
+
     batch_axes = batch["axis"]
     batch_frames = batch["frame"]
     batch_walen_slope = batch["walen_slope"]
@@ -952,6 +1103,7 @@ def _validate_map(
         batch_walen_slope,
         nominal_window_length,
         sample_spacing,
+        map_resolution,
     )
 
     y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
@@ -1022,19 +1174,35 @@ def _validate_map(
 
     return mask_fit & mask_valid & mask_current & mask_closed, {
         "map_Az": reconstructed_map.magnetic_potential,
-        "map_Bx": reconstructed_map.magnetic_field_x,
-        "map_By": reconstructed_map.magnetic_field_y,
-        "map_Bz": reconstructed_map.magnetic_field_z,
-        "map_Jx": reconstructed_map.current_density_x,
-        "map_Jy": reconstructed_map.current_density_y,
-        "map_Jz": reconstructed_map.current_density_z,
+        "map_B": torch.stack(
+            [
+                reconstructed_map.magnetic_field_x,
+                reconstructed_map.magnetic_field_y,
+                reconstructed_map.magnetic_field_z,
+            ],
+            dim=-1,
+        ),
+        "map_J": torch.stack(
+            [
+                reconstructed_map.current_density_x,
+                reconstructed_map.current_density_y,
+                reconstructed_map.current_density_z,
+            ],
+            dim=-1,
+        ),
         "map_core_mask": reconstructed_map.core_mask,
         "residue_fit": reconstructed_map.error_fit,
     }
 
 
 def _generate_map(
-    data, axes, frames, walen_slope, nominal_window_length, sample_spacing
+    data,
+    axes,
+    frames,
+    walen_slope,
+    nominal_window_length,
+    sample_spacing,
+    map_resolution,
 ):
     batch_magnetic_field = data["magnetic_field"]
     batch_gas_pressure = data["gas_pressure"]
@@ -1063,7 +1231,7 @@ def _generate_map(
         alpha=alpha,
         sample_spacing=dx,
         poly_order=3,
-        resolution=MAP_RESOLUTION,
+        resolution=map_resolution,
         pad=0,
     )
 

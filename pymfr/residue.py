@@ -8,7 +8,7 @@ def _calculate_interpolated_values(potential, quantity):
     assert len(quantity.shape) == 2
 
     if len(potential) == 0:
-        return torch.empty((0,), device=potential.device, dtype=torch.float32)
+        return torch.empty_like(quantity), torch.empty_like(quantity)
 
     inflection_points = potential[..., 1:-1].abs().argmax(dim=-1) + 1
 
