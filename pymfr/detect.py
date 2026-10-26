@@ -185,6 +185,12 @@ def detect_flux_ropes(
 
         output_datasets.append(output)
 
+        # Claude: each window length allocates differently shaped tensors, so the
+        # Claude: MPS allocator's cache keeps growing (past physical RAM, by default)
+        # Claude: unless it is released between window lengths
+        if data.device.type == "mps":
+            torch.mps.empty_cache()
+
     return xarray.concat(output_datasets, dim="event")
 
 
