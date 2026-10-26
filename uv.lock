@@ -767,6 +767,19 @@ wheels = [
 ]
 
 [[package]]
+name = "h5netcdf"
+version = "1.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ef/03/92d6cc02c0055158167255980461155d6e17f1c4143c03f8bcc18d3e3f3a/h5netcdf-1.8.1.tar.gz", hash = "sha256:9b396a4cc346050fc1a4df8523bc1853681ec3544e0449027ae397cb953c7a16", size = 78679, upload-time = "2026-01-23T07:35:31.233Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b1/8b/88f16936a8e8070a83d36239555227ecd91728f9ef222c5382cda07e0fd6/h5netcdf-1.8.1-py3-none-any.whl", hash = "sha256:a76ed7cfc9b8a8908ea7057c4e57e27307acff1049b7f5ed52db6c2247636879", size = 62915, upload-time = "2026-01-23T07:35:30.195Z" },
+]
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -2169,6 +2182,7 @@ version = "3.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "array-api-compat" },
+    { name = "h5netcdf" },
     { name = "numpy" },
     { name = "scipy" },
     { name = "tensordict" },
@@ -2190,6 +2204,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "array-api-compat", specifier = ">=1.15.0" },
+    { name = "h5netcdf", specifier = ">=1.8.1" },
     { name = "numpy" },
     { name = "scipy" },
     { name = "tensordict", specifier = ">=0.15.1" },
