@@ -34,7 +34,7 @@ def detect_flux_ropes(
     n_trial_axes=256,
     max_processing_resolution=32,
     map_resolution=11,
-    cuda=None,
+    device=None,
     progress_bar=True,
 ) -> xarray.Dataset:
     """
@@ -92,8 +92,8 @@ def detect_flux_ropes(
         carefully after extensive analysis of many example events.
         A value too low would have too little detail and excessive smoothing,
         whereas a value too high can result in an unstable and meaningless reconstruction.
-    cuda : bool or None, default None
-        Whether to use the GPU. None uses the GPU only if available.
+    device : str, torch.device, or None, default None
+        Device to run on. None uses CUDA if available, then MPS, then CPU.
     progress_bar : bool, default True
         Whether to show a progress bar over window lengths.
 
@@ -111,18 +111,26 @@ def detect_flux_ropes(
     http://iopscience.iop.org/article/10.3847/1538-4365/aae57d
     """
 
-    if cuda is None:
-        cuda = torch.cuda.is_available()
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     # convert all arrays to tensor so that numpy arrays can be given
-    data = TensorDict(
-        magnetic_field=magnetic_field,
-        velocity=velocity,
-        density=density,
-        gas_pressure=gas_pressure,
-        batch_size=[len(magnetic_field)],
-        device="cuda" if cuda else "cpu",
-    ).float()  # convert to float32 explicitly also, for consistent behavior regardless of input dtype
+    data = (
+        TensorDict(
+            magnetic_field=magnetic_field,
+            velocity=velocity,
+            density=density,
+            gas_pressure=gas_pressure,
+            batch_size=[len(magnetic_field)],
+        )
+        .float()  # convert to float32 explicitly also, for consistent behavior regardless of input dtype
+        .to(device)
+    )
 
     assert data["magnetic_field"].shape[1:] == (3,)
     assert data["velocity"].shape == data["magnetic_field"].shape
@@ -221,6 +229,7 @@ def _detect_for_window_length(
         window_index=torch.arange(len(windows), device=windows["start"].device),
         window_start=windows["start"],
         batch_size=windows.batch_size,
+        device=data.device,
     )
 
     # estimate the HT frames
@@ -1007,7 +1016,12 @@ def _find_axes(
     )
 
     if "magnetic_field_gradient" in batch_data.keys():  # noqa: SIM118
-        batch_minrmsdd = minrmsdd(batch_data["magnetic_field_gradient"])
+        # Claude: eigh isn't implemented on MPS, so compute it on CPU there
+        gradient = batch_data["magnetic_field_gradient"]
+        if gradient.device.type == "mps":
+            batch_minrmsdd = minrmsdd(gradient.cpu()).to(gradient.device)
+        else:
+            batch_minrmsdd = minrmsdd(gradient)
     else:
         batch_minrmsdd = torch.full_like(batch_axes, torch.nan)
 
