@@ -1,3 +1,5 @@
+import math
+
 import scipy.constants
 import scipy.integrate
 import torch
@@ -91,6 +93,9 @@ def _laplacian(potential, peak_sign, poly_order: int, field_line_quantity_coeffs
 def _polyfit(potential, quantity, polyorder: int):
     x = torch.stack([potential**i for i in range(polyorder + 1)], dim=-1)
 
+    # Claude: lstsq isn't implemented on MPS, so solve on CPU there
+    if x.device.type == "mps":
+        return torch.linalg.lstsq(x.cpu(), quantity.cpu()).solution.to(x.device)
     coeffs = torch.linalg.lstsq(x, quantity).solution
     return coeffs
 
@@ -117,7 +122,7 @@ def _evaluate_fit_values(coeffs, potential, peak_sign):
 # @torch.jit.script
 def _three_point_smooth(solution, height: float):
     # note: this is an in-place operation
-    center_weight = 1 - torch.abs(height) / 3
+    center_weight = 1 - abs(height) / 3
     edge_weight = (1 - center_weight) / 2
     solution[..., 1:-1] = center_weight * solution[..., 1:-1] + edge_weight * (
         solution[..., :-2] + solution[..., 2:]
@@ -227,6 +232,16 @@ def _generate_connection_map(potential):
     return core_mask.reshape(original_shape)
 
 
+def _adaptive_avg_pool1d(input, output_size: int):
+    # MPS only supports adaptive pooling when the input length is divisible
+    # by output_size (https://github.com/pytorch/pytorch/issues/96056), so
+    # we just use the CPU for this when MPS is used
+    # TODO replace this with a more robust solution
+    if input.device.type == "mps" and input.shape[-1] % output_size != 0:
+        return F.adaptive_avg_pool1d(input.cpu(), output_size).to(input.device)
+    return F.adaptive_avg_pool1d(input, output_size)
+
+
 # @torch.jit.script
 def _reconstruct_map(
     magnetic_field_observed,
@@ -250,7 +265,7 @@ def _reconstruct_map(
 
     if inner_resolution < original_resolution:
         magnetic_field_observed = (
-            F.adaptive_avg_pool1d(
+            _adaptive_avg_pool1d(
                 magnetic_field_observed.reshape(-1, original_resolution, 3).transpose(
                     -1, -2
                 ),
@@ -259,10 +274,10 @@ def _reconstruct_map(
             .transpose(-1, -2)
             .reshape(magnetic_field_observed.shape[:-2] + (inner_resolution, 3))
         )
-        gas_pressure_observed = F.adaptive_avg_pool1d(
+        gas_pressure_observed = _adaptive_avg_pool1d(
             gas_pressure_observed.reshape(-1, 1, original_resolution), inner_resolution
         ).reshape(gas_pressure_observed.shape[:-1] + (inner_resolution,))
-        magnetic_potential_observed = F.adaptive_avg_pool1d(
+        magnetic_potential_observed = _adaptive_avg_pool1d(
             magnetic_potential_observed.reshape(-1, 1, original_resolution),
             inner_resolution,
         ).reshape(magnetic_potential_observed.shape[:-1] + (inner_resolution,))
@@ -410,14 +425,14 @@ def _reconstruct_map(
 
         second_derivative_y = second_derivative_y_observed
 
-        for i in torch.arange(
-            1, extrapolation_length * extra_steps + 1, device=potential.device
-        ):
-            height = torch.clip(
+        # Claude: i is a Python int, not a device tensor, so using it to index
+        # Claude: output_map doesn't force a GPU sync every step
+        for i in range(1, extrapolation_length * extra_steps + 1):
+            height = min(
                 i
                 / (extrapolation_length * extra_steps)
                 * (resolution / inner_resolution),
-                max=0.7,
+                0.7,
             )
 
             potential = _three_point_smooth(
@@ -439,8 +454,7 @@ def _reconstruct_map(
 
             output_map[
                 ...,
-                extrapolation_length
-                + torch.ceil(i / extra_steps).to(torch.long) * direction,
+                extrapolation_length + math.ceil(i / extra_steps) * direction,
                 :,
             ] = potential
 

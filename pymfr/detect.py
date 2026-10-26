@@ -201,7 +201,7 @@ def _detect_for_window_length(
     original_timeseries = TensorDict(
         data=data,
         smooth_angles=_calculate_smooth_angles(data, nominal_window_length),
-        overlaps=contains_existing.to(float),
+        overlaps=contains_existing.to(data.dtype),
         batch_size=data.batch_size,
         device=data.device,
     )
@@ -1108,8 +1108,6 @@ def _validate_map(
 
     y_observed = reconstructed_map.magnetic_potential.shape[-2] // 2
 
-    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
-
     sign = torch.sign(
         reconstructed_map.magnetic_potential[:, y_observed, :].mean(dim=1)
     )
@@ -1129,8 +1127,8 @@ def _validate_map(
     ].amax(dim=-1)
     minimum_closed = torch.nan_to_num(closed_values, torch.inf).flatten(-2).min(dim=-1)
 
-    height = torch.any(reconstructed_map.core_mask, dim=-1).to(float).sum(dim=-1)
-    width = torch.any(reconstructed_map.core_mask, dim=-2).to(float).sum(dim=-1)
+    height = torch.any(reconstructed_map.core_mask, dim=-1).sum(dim=-1)
+    width = torch.any(reconstructed_map.core_mask, dim=-2).sum(dim=-1)
 
     closed_current_values = torch.abs(
         torch.where(
