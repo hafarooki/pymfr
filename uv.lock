@@ -2208,7 +2208,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "scipy" },
     { name = "tensordict", specifier = ">=0.15.1" },
-    { name = "torch" },
+    { name = "torch", specifier = ">=2.14" },
     { name = "tqdm" },
     { name = "xarray" },
 ]

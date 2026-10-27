@@ -17,7 +17,7 @@ dependencies = [
     "numpy",
     "scipy",
     "tensordict>=0.15.1",
-    "torch",
+    "torch>=2.14",
     "tqdm",
     "xarray",
 ]

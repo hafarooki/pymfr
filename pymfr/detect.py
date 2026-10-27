@@ -1022,12 +1022,7 @@ def _find_axes(
     )
 
     if "magnetic_field_gradient" in batch_data.keys():  # noqa: SIM118
-        # Claude: eigh isn't implemented on MPS, so compute it on CPU there
-        gradient = batch_data["magnetic_field_gradient"]
-        if gradient.device.type == "mps":
-            batch_minrmsdd = minrmsdd(gradient.cpu()).to(gradient.device)
-        else:
-            batch_minrmsdd = minrmsdd(gradient)
+        batch_minrmsdd = minrmsdd(batch_data["magnetic_field_gradient"])
     else:
         batch_minrmsdd = torch.full_like(batch_axes, torch.nan)
 
