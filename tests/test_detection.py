@@ -89,3 +89,27 @@ def test_output_includes_minrmsdd_when_provided_gradient(sample_data, detection_
     )
 
     assert "minrmsdd" in results.data_vars
+
+
+def test_axes_within_10_degrees_of_minrmsdd(sample_data, detection_kwargs):
+    """Given a gradient, all detected axes are within 10 degrees of the minrmsdd direction."""
+    sample_data = {key: value[:24 * 60] for key, value in sample_data.items()}
+    rng = np.random.default_rng(0)
+    magnetic_field_gradient = rng.normal(
+        size=(len(sample_data["magnetic_field"]), 3, 3)
+    )
+
+    def minrmsdd_cos_angles(max_minrmsdd_angle):
+        results = detect_flux_ropes(
+            **sample_data,
+            **detection_kwargs,
+            magnetic_field_gradient=magnetic_field_gradient,
+            max_minrmsdd_angle=max_minrmsdd_angle,
+        )
+        assert len(results.window_start) > 0
+        # minrmsdd is only defined up to sign
+        return np.abs((results.axis.values * results.minrmsdd.values).sum(axis=-1))
+
+    assert np.all(minrmsdd_cos_angles(10) >= np.cos(np.radians(10)) - 1e-6)
+    # sanity check: without the restriction, some axes are farther away
+    assert np.any(minrmsdd_cos_angles(90) < np.cos(np.radians(10)))

@@ -32,6 +32,7 @@ def detect_flux_ropes(
     threshold_walen_slope=0.3,
     threshold_flow_field_alignment=0.8,
     n_trial_axes=256,
+    max_minrmsdd_angle=10,
     max_processing_resolution=32,
     map_resolution=11,
     device=None,
@@ -80,6 +81,9 @@ def detect_flux_ropes(
         determination algorithm. Odd number is desirable so that one of the trial
         axes includes the previous iteration's best orientation (starting with avg
         field direction).
+    max_minrmsdd_angle : float, default 10
+        If ``magnetic_field_gradient`` is given, only trial axes within this many
+        degrees of the minrmsdd are considered.
     max_processing_resolution : int or None, default 32
         Scale sliding window data down to approximately this size (if larger)
         before generating sliding windows to reduce memory usage. If None, windows
@@ -179,6 +183,7 @@ def detect_flux_ropes(
             threshold_walen_slope=threshold_walen_slope,
             threshold_flow_field_alignment=threshold_flow_field_alignment,
             n_trial_axes=n_trial_axes,
+            max_minrmsdd_angle=max_minrmsdd_angle,
             max_processing_resolution=max_processing_resolution,
             map_resolution=map_resolution,
         )
@@ -207,6 +212,7 @@ def _detect_for_window_length(
     threshold_walen_slope,
     threshold_flow_field_alignment,
     n_trial_axes,
+    max_minrmsdd_angle,
     max_processing_resolution,
     map_resolution,
 ):
@@ -261,6 +267,7 @@ def _detect_for_window_length(
             _find_and_check_vertical_directions,
             batch_size=batch_size,
             n_trial_axes=n_trial_axes,
+            max_minrmsdd_angle=max_minrmsdd_angle,
         ),
         partial(
             _get_frame_quality_mask, threshold_frame_quality=threshold_frame_quality
@@ -271,6 +278,7 @@ def _detect_for_window_length(
             threshold_walen_slope=threshold_walen_slope,
             threshold_flow_field_alignment=threshold_flow_field_alignment,
             n_trial_axes=n_trial_axes,
+            max_minrmsdd_angle=max_minrmsdd_angle,
         ),
         partial(
             _validate_map,
@@ -651,7 +659,9 @@ def _sliding_frames(data, window_length, window_step):
     return frames
 
 
-def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_axes):
+def _find_and_check_vertical_directions(
+    batch, batch_data, batch_size, n_trial_axes, max_minrmsdd_angle
+):
     """
     estimate the flux rope y-axis of each window, and keep only the windows
     where the field component along it changes sign exactly once
@@ -692,7 +702,7 @@ def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_a
     too_close_indices = torch.nonzero(too_close).flatten()
 
     if len(too_close_indices) > 0:
-        too_close_field = batch_magnetic_field[too_close_indices]
+        too_close_batch_data = batch_data[too_close_indices]
         too_close_mean_directions = avg_field_direction.index_select(
             0, too_close_indices
         )
@@ -768,8 +778,10 @@ def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_a
             axis_batch_step, dim=1
         ):
             # broadcast view pairing each field with each trial direction
-            axis_batch_field = too_close_field.unsqueeze(1).expand(
-                -1, axis_batch_directions.shape[1], -1, -1
+            axis_batch_field = (
+                too_close_batch_data["magnetic_field"]
+                .unsqueeze(1)
+                .expand(-1, axis_batch_directions.shape[1], -1, -1)
             )
             axis_batch_potential = _calculate_normalized_potential(
                 axis_batch_field, axis_batch_directions
@@ -788,12 +800,21 @@ def _find_and_check_vertical_directions(batch, batch_data, batch_size, n_trial_a
             )
 
             if torch.any(axis_batch_inflection_mask):
+                axis_batch_gradient = None
+                if "magnetic_field_gradient" in too_close_batch_data:
+                    axis_batch_gradient = (
+                        too_close_batch_data["magnetic_field_gradient"]
+                        .unsqueeze(1)
+                        .expand(-1, axis_batch_directions.shape[1], -1, -1, -1)
+                    )[axis_batch_inflection_mask]
                 axis_batch_min_residue[axis_batch_inflection_mask] = (
                     _minimize_axis_residue(
                         axis_batch_field[axis_batch_inflection_mask],
                         axis_batch_directions[axis_batch_inflection_mask],
                         axis_batch_potential[axis_batch_inflection_mask],
                         n_trial_axes,
+                        magnetic_field_gradient=axis_batch_gradient,
+                        max_minrmsdd_angle=max_minrmsdd_angle,
                     )[1]
                 )
 
@@ -859,8 +880,18 @@ def _is_good_vertical_component(magnetic_field, vertical_directions):
 
 
 def _minimize_axis_residue(
-    magnetic_field, vertical_directions, potential, n_trial_axes, return_residue=True
+    magnetic_field,
+    vertical_directions,
+    potential,
+    n_trial_axes,
+    magnetic_field_gradient=None,
+    max_minrmsdd_angle=None,
 ):
+    """
+    returns (optimal_axes, residue, minrmsdd); if magnetic_field_gradient is given,
+    only trial axes within max_minrmsdd_angle degrees of the minrmsdd are considered
+    (minrmsdd is NaN otherwise)
+    """
     # use avg magnetic field as initial guess
     initial_guess = magnetic_field.mean(dim=-2)
     # ensure perpendicular to vertical direction
@@ -889,15 +920,25 @@ def _minimize_axis_residue(
     # Bz itself is conserved along field lines, and this way we can compare the SIGN of Bz as well
     error_diff_axis = _calculate_residue_map(magnetic_field, trial_axes, potential)
 
+    if magnetic_field_gradient is not None:
+        axis_minrmsdd = minrmsdd(magnetic_field_gradient)
+        # exclude trial axes too far from the minrmsdd
+        # abs() since the minrmsdd is only defined up to sign
+        cos_angle = torch.abs((trial_axes * axis_minrmsdd.unsqueeze(1)).sum(dim=-1))
+        error_diff_axis = torch.where(
+            cos_angle >= math.cos(math.radians(max_minrmsdd_angle)),
+            error_diff_axis,
+            torch.inf,
+        )
+    else:
+        axis_minrmsdd = torch.full_like(initial_axes, torch.nan)
+
     # select the best orientation
     residue, argmin = error_diff_axis.min(dim=-1)
     index = argmin.view((*argmin.shape, 1, 1)).expand((*argmin.shape, 1, 3))
     optimal_axes = trial_axes.gather(-2, index).squeeze(-2)
 
-    if return_residue:
-        return optimal_axes, residue
-    else:
-        return optimal_axes
+    return optimal_axes, residue, axis_minrmsdd
 
 
 def _calculate_residue_map(magnetic_field, trial_axes, potential):
@@ -920,18 +961,13 @@ def _calculate_residue_map(magnetic_field, trial_axes, potential):
 
 
 def _get_frame_quality_mask(batch, batch_data, threshold_frame_quality):
-    batch_frames = batch["frame"]
-    batch_magnetic_field = batch_data["magnetic_field"]
-    batch_velocity = batch_data["velocity"]
-    batch_electric_field = -torch.cross(batch_velocity, batch_magnetic_field, dim=-1)
-
     frame_quality = _calculate_frame_quality(
-        batch_frames, batch_magnetic_field, batch_velocity, batch_electric_field
+        batch["frame"], batch_data["magnetic_field"], batch_data["velocity"]
     )
     return frame_quality > threshold_frame_quality, {"frame_quality": frame_quality}
 
 
-def _calculate_frame_quality(frames, magnetic_field, velocity, electric_field):
+def _calculate_frame_quality(frames, magnetic_field, velocity):
     electric_field = -torch.cross(velocity, magnetic_field, dim=-1)
 
     remaining_electric_field = -torch.cross(
@@ -953,16 +989,19 @@ def _find_axes(
     threshold_flow_field_alignment,
     threshold_diff,
     n_trial_axes,
+    max_minrmsdd_angle,
 ):
     batch_normalized_potential = _calculate_normalized_potential(
         batch_data["magnetic_field"], batch["vertical_direction"]
     )
 
-    batch_axes, axis_residue = _minimize_axis_residue(
+    batch_axes, axis_residue, batch_minrmsdd = _minimize_axis_residue(
         batch_data["magnetic_field"],
         batch["vertical_direction"],
         batch_normalized_potential,
         n_trial_axes,
+        magnetic_field_gradient=batch_data.get("magnetic_field_gradient", None),
+        max_minrmsdd_angle=max_minrmsdd_angle,
     )
 
     axial_component = (batch_data["magnetic_field"] * batch_axes[:, None]).sum(-1)
@@ -1020,11 +1059,6 @@ def _find_axes(
         & (transverse_pressure_sign == 1)
         & (Bz_sign == 1)
     )
-
-    if "magnetic_field_gradient" in batch_data.keys():  # noqa: SIM118
-        batch_minrmsdd = minrmsdd(batch_data["magnetic_field_gradient"])
-    else:
-        batch_minrmsdd = torch.full_like(batch_axes, torch.nan)
 
     return mask, {
         "axis": batch_axes,
